@@ -1,0 +1,10 @@
+# Local tooling environments and generated Python bytecode.
+.venv/
+**/.venv/
+**/dist/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Future generator output.
+build/
