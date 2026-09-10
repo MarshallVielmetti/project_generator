@@ -135,10 +135,7 @@ def _validate_exercise_references(
             )
         if source is not None:
             source_paths.append((f"exercise {exercise.id} source", source))
-        for dependency in exercise.requires:
-            if dependency not in by_id:
-                # A second pass below catches dependencies declared later.
-                continue
+        # Dependencies are validated in a second pass below.
         for test in exercise.tests.public:
             test_path = _node_path(test)
             path = validate_input_path(
