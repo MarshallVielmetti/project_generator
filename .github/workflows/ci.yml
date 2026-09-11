@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.13"
       - uses: astral-sh/setup-uv@v6
-      - run: uv sync --project tools/startergen --locked
+      - run: uv sync --project tools/startergen --locked --group test
       - run: uv run --project tools/startergen pytest -q
 
   canonical:
@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: "3.13"
       - uses: astral-sh/setup-uv@v6
-      - run: uv sync --project tools/startergen --locked
+      - run: uv sync --project tools/startergen --locked --group test
       - run: uv run --project tools/startergen startergen validate --root tools/startergen/tests/fixtures/mvp_canonical_project
       - run: uv run --project ${{ github.workspace }}/tools/startergen pytest -q tests/private tests/public tests/smoke
         working-directory: tools/startergen/tests/fixtures/mvp_canonical_project
@@ -45,7 +45,7 @@ jobs:
         with:
           python-version: "3.13"
       - uses: astral-sh/setup-uv@v6
-      - run: uv sync --project tools/startergen --locked
+      - run: uv sync --project tools/startergen --locked --group test
       - run: uv run --project tools/startergen startergen check --root tools/startergen/tests/fixtures/mvp_canonical_project --json
 
   starter-smoke:
@@ -57,7 +57,7 @@ jobs:
         with:
           python-version: "3.13"
       - uses: astral-sh/setup-uv@v6
-      - run: uv sync --project tools/startergen --locked
+      - run: uv sync --project tools/startergen --locked --group test
       - run: uv run --project ${{ github.workspace }}/tools/startergen startergen build --root .
         working-directory: tools/startergen/tests/fixtures/mvp_canonical_project
       - run: uv run --project ${{ github.workspace }}/tools/startergen pytest -q tests/smoke
@@ -75,7 +75,7 @@ jobs:
         with:
           python-version: "3.13"
       - uses: astral-sh/setup-uv@v6
-      - run: uv sync --project tools/startergen --locked
+      - run: uv sync --project tools/startergen --locked --group test
       - run: uv run --project ${{ github.workspace }}/tools/startergen startergen build --root .
         working-directory: tools/startergen/tests/fixtures/mvp_canonical_project
       - name: Run incomplete public exercises
