@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
+from startergen.assembly import AssemblyError, build_project
 from startergen.validate import validate_project
 
 
@@ -22,6 +24,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     validate.add_argument(
         "--json", action="store_true", help="emit a machine-readable diagnostic report"
+    )
+    build = commands.add_parser("build", help="assemble and promote a starter artifact")
+    build.add_argument(
+        "--root", required=True, type=Path, help="canonical project root"
+    )
+    build.add_argument(
+        "--json", action="store_true", help="emit a machine-readable build report"
     )
     return parser
 
@@ -42,6 +51,35 @@ def main(argv: list[str] | None = None) -> int:
             for diagnostic in report.diagnostics:
                 print(diagnostic.format_text(), file=sys.stderr)
         return 0 if report.ok else 1
+    if args.command == "build":
+        try:
+            result = build_project(args.root)
+        except AssemblyError as exc:
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "built": False,
+                            "code": exc.code,
+                            "message": str(exc),
+                            "diagnostics": [
+                                diagnostic.to_dict() for diagnostic in exc.diagnostics
+                            ],
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"build failed: {exc.code}: {exc}", file=sys.stderr)
+                for diagnostic in exc.diagnostics:
+                    print(diagnostic.format_text(), file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(f"Built starter artifact: {result.output}")
+        return 0
     return 2  # pragma: no cover - protected by argparse's required subcommand
 
 

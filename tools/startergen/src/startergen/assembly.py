@@ -1,0 +1,583 @@
+"""Deterministic, recoverable assembly of student starter artifacts."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import stat
+import tempfile
+import uuid
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from types import TracebackType
+from typing import Any, Self
+
+from pydantic import ValidationError
+
+from startergen import __version__
+from startergen.diagnostics import Diagnostic
+from startergen.paths import is_safe_relative_path, project_path
+from startergen.schema import ExerciseMetadata, ProjectMetadata
+from startergen.transform import TransformError, TransformTarget, transform_sources
+from startergen.validate import validate_project
+from startergen.yaml_io import YamlInputError, load_yaml
+
+MANIFEST_SCHEMA_VERSION = 1
+
+# These names are deliberately conservative. The allowlist remains the source
+# of truth, while these rules prevent a broad directory allowlist from leaking
+# repository metadata, caches, tooling, or instructor-only material.
+DENIED_PATH_COMPONENTS = frozenset(
+    {
+        ".git",
+        ".github",
+        ".startergen",
+        ".venv",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "build",
+        "dist",
+        "generation",
+        "instructor",
+        "private",
+        "tools",
+    }
+)
+DENIED_FILE_NAMES = frozenset(
+    {
+        ".ds_store",
+        ".env",
+        "credentials",
+        "credentials.json",
+        "id_rsa",
+        "secret",
+        "secrets",
+    }
+)
+DENIED_SUFFIXES = frozenset(
+    {".key", ".pem", ".p12", ".pfx", ".pyc", ".pyo", ".sqlite", ".sqlite3"}
+)
+
+
+class AssemblyError(RuntimeError):
+    """Actionable error raised when an artifact cannot be assembled."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        diagnostics: Iterable[Diagnostic] = (),
+        cause: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.diagnostics = tuple(diagnostics)
+        self.cause = cause
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactFile:
+    """One file entry in the generated artifact manifest."""
+
+    path: str
+    mode: int
+    size: int
+    sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "mode": self.mode,
+            "size": self.size,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BuildResult:
+    """Summary of a successfully promoted starter artifact."""
+
+    output: Path
+    manifest: Path
+    files: tuple[ArtifactFile, ...]
+    transformed_files: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "output": self.output.as_posix(),
+            "manifest": self.manifest.as_posix(),
+            "files": [file.to_dict() for file in self.files],
+            "transformed_files": list(self.transformed_files),
+        }
+
+
+def deny_reason(relative_path: str) -> str | None:
+    """Return the built-in deny rule matching a project-relative path."""
+
+    parts = PurePosixPath(relative_path).parts
+    folded_parts = tuple(part.casefold() for part in parts)
+    for part in folded_parts:
+        if part in DENIED_PATH_COMPONENTS:
+            return f"reserved path component {part!r}"
+    filename = folded_parts[-1] if folded_parts else ""
+    if filename in DENIED_FILE_NAMES:
+        return f"reserved file name {filename!r}"
+    if filename.startswith((".env.", "id_rsa")):
+        return f"credential-like file name {filename!r}"
+    if any(filename.endswith(suffix) for suffix in DENIED_SUFFIXES):
+        return f"reserved file suffix in {filename!r}"
+    if filename.endswith((".log", ".token")):
+        return f"credential or generated log file {filename!r}"
+    return None
+
+
+def _path_key(relative_path: str) -> str:
+    return relative_path.replace("\\", "/").casefold()
+
+
+def _excluded(relative_path: str, exclusions: tuple[str, ...]) -> bool:
+    key = _path_key(relative_path)
+    return any(
+        key == excluded or key.startswith(f"{excluded}/") for excluded in exclusions
+    )
+
+
+def _assert_safe_existing_path(root: Path, path: Path) -> None:
+    """Reject symlink and special-file components before reading or writing."""
+
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise AssemblyError(
+            "outside_root", f"path escapes the project root: {path}"
+        ) from exc
+    current = root
+    for index, component in enumerate(relative.parts):
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(info.st_mode):
+            raise AssemblyError(
+                "symlink_input",
+                f"path contains a symlink component: {current.relative_to(root)}",
+            )
+        is_final = index == len(relative.parts) - 1
+        if not is_final and not stat.S_ISDIR(info.st_mode):
+            raise AssemblyError(
+                "special_input",
+                f"path component is not a directory: {current.relative_to(root)}",
+            )
+        if is_final and not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise AssemblyError(
+                "special_input",
+                f"path is not an ordinary file or directory: {current.relative_to(root)}",
+            )
+
+
+def _iter_input_files(
+    root: Path,
+    include_path: Path,
+    *,
+    exclusions: tuple[str, ...],
+) -> Iterator[tuple[str, Path]]:
+    """Yield ordinary files below one allowlisted path in stable order."""
+
+    include_relative = include_path.relative_to(root).as_posix()
+    if deny_reason(include_relative) is not None:
+        raise AssemblyError(
+            "denied_input",
+            f"allowlisted input is prohibited: {include_relative}",
+        )
+    if include_path.is_file():
+        if not _excluded(include_relative, exclusions):
+            yield include_relative, include_path
+        return
+
+    pending: list[tuple[str, Path]] = [(include_relative, include_path)]
+    while pending:
+        relative, current = pending.pop()
+        try:
+            entries = sorted(
+                os.scandir(current),
+                key=lambda entry: entry.name.casefold(),
+                reverse=True,
+            )
+        except OSError as exc:
+            raise AssemblyError(
+                "enumeration_failed",
+                f"could not enumerate allowlisted directory {relative}: {exc}",
+                cause=exc,
+            ) from exc
+        for entry in entries:
+            child_relative = f"{relative}/{entry.name}"
+            if _excluded(child_relative, exclusions) or deny_reason(child_relative):
+                continue
+            child = current / entry.name
+            info = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise AssemblyError(
+                    "symlink_input",
+                    f"allowlisted input contains a symlink: {child_relative}",
+                )
+            if stat.S_ISDIR(info.st_mode):
+                pending.append((child_relative, child))
+            elif stat.S_ISREG(info.st_mode):
+                yield child_relative, child
+            else:
+                raise AssemblyError(
+                    "special_input",
+                    f"allowlisted input contains a special file: {child_relative}",
+                )
+
+
+def enumerate_allowlist(
+    root: Path,
+    include: Iterable[str],
+    exclude: Iterable[str] = (),
+) -> dict[str, Path]:
+    """Enumerate the explicit publication allowlist.
+
+    The returned keys are project-relative POSIX paths and the values are
+    ordinary source files. Denied descendants are omitted; duplicate or
+    case-colliding output paths fail rather than silently overwriting data.
+    """
+
+    root = root.expanduser().resolve()
+    if not root.is_dir():
+        raise AssemblyError(
+            "root_not_directory", f"project root is not a directory: {root}"
+        )
+    exclusions: list[str] = []
+    for value in exclude:
+        if not is_safe_relative_path(value):
+            raise AssemblyError("unsafe_path", f"exclude path is unsafe: {value!r}")
+        exclusions.append(_path_key(value))
+    results: dict[str, Path] = {}
+    keys: dict[str, str] = {}
+    for value in include:
+        if not is_safe_relative_path(value):
+            raise AssemblyError("unsafe_path", f"include path is unsafe: {value!r}")
+        path = project_path(root, value)
+        assert path is not None
+        _assert_safe_existing_path(root, path)
+        if not path.exists():
+            raise AssemblyError(
+                "missing_input", f"allowlisted input does not exist: {value}"
+            )
+        for relative, source in _iter_input_files(
+            root, path, exclusions=tuple(exclusions)
+        ):
+            key = _path_key(relative)
+            previous = keys.get(key)
+            if previous is not None:
+                raise AssemblyError(
+                    "artifact_collision",
+                    f"allowlisted paths {previous!r} and {relative!r} produce the same output path",
+                )
+            keys[key] = relative
+            results[relative] = source
+    return dict(sorted(results.items()))
+
+
+def _sha256(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+def _artifact_files(root: Path) -> tuple[ArtifactFile, ...]:
+    entries: list[ArtifactFile] = []
+    for path in sorted(
+        root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()
+    ):
+        relative = path.relative_to(root).as_posix()
+        if relative == ".startergen/manifest.json":
+            continue
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            if stat.S_ISLNK(info.st_mode):
+                raise AssemblyError(
+                    "symlink_output", f"staged output contains a symlink: {relative}"
+                )
+            continue
+        digest, size = _sha256(path)
+        entries.append(
+            ArtifactFile(
+                path=relative,
+                mode=stat.S_IMODE(info.st_mode),
+                size=size,
+                sha256=digest,
+            )
+        )
+    return tuple(entries)
+
+
+def _input_provenance(
+    root: Path, contract_paths: tuple[Path, ...], files: dict[str, Path]
+) -> list[dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for path in (*contract_paths, *files.values()):
+        relative = path.relative_to(root).as_posix()
+        digest, size = _sha256(path)
+        records[relative] = {"path": relative, "sha256": digest, "size": size}
+    return [records[key] for key in sorted(records)]
+
+
+def _write_manifest(
+    staging: Path,
+    *,
+    config: ProjectMetadata,
+    generator_version: str,
+    provenance: list[dict[str, Any]],
+) -> tuple[Path, tuple[ArtifactFile, ...]]:
+    files = _artifact_files(staging)
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "generator_version": generator_version,
+        "project": {
+            "name": config.project.name,
+            "import_package": config.project.import_package,
+        },
+        "provenance": {"inputs": provenance},
+        "files": [entry.to_dict() for entry in files],
+    }
+    manifest_path = staging / ".startergen" / "manifest.json"
+    manifest_path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(manifest_path, 0o644)
+    return manifest_path, files
+
+
+try:  # pragma: no cover - the fallback is exercised only on Windows.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
+
+class _BuildLock:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.handle: Any | None = None
+
+    def __enter__(self) -> Self:
+        self.path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        self.handle = self.path.open("a+")
+        if fcntl is not None:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+        else:  # pragma: no cover
+            import msvcrt
+
+            self.handle.seek(0)
+            self.handle.write(" ")
+            self.handle.flush()
+            msvcrt.locking(self.handle.fileno(), msvcrt.LK_LOCK, 1)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        assert self.handle is not None
+        if fcntl is not None:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        self.handle.close()
+
+
+def _resolve_output(root: Path, value: str) -> tuple[Path, Path]:
+    output = project_path(root, value)
+    build_root = root / "build"
+    if output is None:
+        raise AssemblyError(
+            "unsafe_destination", f"starter output path is unsafe: {value!r}"
+        )
+    try:
+        relative_to_build = output.relative_to(build_root)
+    except ValueError as exc:
+        raise AssemblyError(
+            "destination_outside_build", f"starter output must be below build/: {value}"
+        ) from exc
+    if not relative_to_build.parts:
+        raise AssemblyError(
+            "invalid_destination", "starter output cannot be build/ itself"
+        )
+    _assert_safe_existing_path(root, build_root)
+    _assert_safe_existing_path(root, output)
+    if output.exists() and not output.is_dir():
+        raise AssemblyError(
+            "invalid_destination", f"starter output is not a directory: {value}"
+        )
+    build_root.mkdir(mode=0o755, parents=True, exist_ok=True)
+    output.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    return build_root, output
+
+
+def _copy_files(files: dict[str, Path], staging: Path) -> None:
+    for relative, source in files.items():
+        destination = staging.joinpath(*relative.split("/"))
+        destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        source_info = source.lstat()
+        if not stat.S_ISREG(source_info.st_mode):
+            raise AssemblyError(
+                "special_input", f"allowlisted source is not a file: {relative}"
+            )
+        shutil.copyfile(source, destination)
+        os.chmod(destination, stat.S_IMODE(source_info.st_mode))
+
+
+def _source_output_path(
+    root: Path, files: dict[str, Path], relative: str
+) -> str | None:
+    candidate = project_path(root, relative)
+    if candidate is None or not candidate.exists():
+        return None
+    for output_relative, source in files.items():
+        try:
+            if candidate.samefile(source):
+                return output_relative
+        except FileNotFoundError:
+            return None
+    return None
+
+
+def _promote(staging: Path, output: Path, build_root: Path) -> None:
+    backup = build_root / f".startergen-backup-{uuid.uuid4().hex}"
+    had_previous = output.exists()
+    if had_previous:
+        output.rename(backup)
+    try:
+        staging.rename(output)
+    except BaseException:
+        if had_previous and backup.exists() and not output.exists():
+            backup.rename(output)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup)
+
+
+def _load_contracts(root: Path) -> tuple[ProjectMetadata, ExerciseMetadata]:
+    try:
+        config = ProjectMetadata.model_validate(
+            load_yaml(root / "teaching" / "config.yml")
+        )
+        exercises = ExerciseMetadata.model_validate(
+            load_yaml(root / "teaching" / "exercises.yml")
+        )
+    except (YamlInputError, ValidationError) as exc:
+        raise AssemblyError(
+            "contract_load_failed",
+            f"validated contracts could not be loaded: {exc}",
+            cause=exc,
+        ) from exc
+    return config, exercises
+
+
+def build_project(
+    root: Path,
+    *,
+    generator_version: str = __version__,
+) -> BuildResult:
+    """Build and atomically promote a validated starter artifact."""
+
+    root = root.expanduser().resolve()
+    report = validate_project(root)
+    if not report.ok:
+        raise AssemblyError(
+            "validation_failed",
+            "project validation failed; no artifact was changed",
+            diagnostics=report.diagnostics,
+        )
+    config, exercises = _load_contracts(root)
+    build_root, output = _resolve_output(root, config.starter.output)
+    contract_paths = (
+        root / "teaching" / "config.yml",
+        root / "teaching" / "exercises.yml",
+    )
+
+    transformed_files: list[str] = []
+    with _BuildLock(build_root / ".startergen.lock"):
+        staging = Path(tempfile.mkdtemp(prefix=".startergen-stage-", dir=build_root))
+        try:
+            files = enumerate_allowlist(
+                root, config.starter.include, config.starter.exclude
+            )
+            provenance = _input_provenance(root, contract_paths, files)
+            _copy_files(files, staging)
+
+            target_pairs: list[tuple[str, TransformTarget]] = []
+            for exercise in exercises.exercises:
+                output_relative = _source_output_path(root, files, exercise.source.file)
+                if output_relative is None:
+                    raise AssemblyError(
+                        "source_not_allowlisted",
+                        f"exercise source is not in the starter allowlist: {exercise.source.file}",
+                    )
+                target_pairs.append(
+                    (
+                        output_relative,
+                        TransformTarget(
+                            exercise_id=exercise.id,
+                            symbol=exercise.source.symbol,
+                            strategy=exercise.starter.strategy,
+                            docstring=exercise.starter.docstring,
+                            body=exercise.starter.body,
+                        ),
+                    )
+                )
+            if target_pairs:
+                try:
+                    transformed = transform_sources(staging, target_pairs, write=True)
+                except TransformError as exc:
+                    raise AssemblyError(
+                        exc.code,
+                        str(exc),
+                        cause=exc,
+                    ) from exc
+                transformed_files.extend(
+                    path.relative_to(staging).as_posix()
+                    for path, result in transformed.items()
+                    if result.changed
+                )
+            _manifest_path, artifact_files = _write_manifest(
+                staging,
+                config=config,
+                generator_version=generator_version,
+                provenance=provenance,
+            )
+            _promote(staging, output, build_root)
+            staging = Path()
+        except AssemblyError:
+            raise
+        except BaseException as exc:
+            raise AssemblyError(
+                "build_failed", f"starter assembly failed: {exc}", cause=exc
+            ) from exc
+        finally:
+            if staging != Path() and staging.exists():
+                shutil.rmtree(staging)
+
+    return BuildResult(
+        output=output,
+        manifest=output / ".startergen" / "manifest.json",
+        files=artifact_files,
+        transformed_files=tuple(sorted(transformed_files)),
+    )
+
+
+assemble_project = build_project
