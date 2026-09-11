@@ -9,7 +9,10 @@ function suite while leaving the surrounding source tree untouched.
 from __future__ import annotations
 
 import io
-import re
+import json
+import keyword
+import os
+import stat
 import textwrap
 import tokenize
 from collections import defaultdict
@@ -100,13 +103,16 @@ class _ScannedDefinition:
 
 
 def _symbol_parts(symbol: str, target: TransformTarget) -> tuple[str, ...]:
-    if not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", symbol):
+    parts = tuple(symbol.split("."))
+    if not parts or any(
+        not part.isidentifier() or keyword.iskeyword(part) for part in parts
+    ):
         raise TransformError(
             "invalid_symbol",
             f"target symbol must be a dotted Python name: {symbol!r}",
             target=target,
         )
-    return tuple(symbol.split("."))
+    return parts
 
 
 def _suite_body(
@@ -242,12 +248,16 @@ def _decorator_name(decorator: cst.Decorator) -> str | None:
 def _unsupported_decorator(node: cst.FunctionDef) -> str | None:
     for decorator in node.decorators:
         name = _decorator_name(decorator)
-        if name == "overload" or name == "typing.overload" or name == "overload":
+        final_component = name.rsplit(".", 1)[-1] if name is not None else None
+        if final_component == "overload":
             return "overload groups are not transformable"
-        if name in {"property", "cached_property"} or (
-            name is not None
-            and name.rsplit(".", 1)[-1] in {"setter", "getter", "deleter"}
-        ):
+        if final_component in {
+            "property",
+            "cached_property",
+            "setter",
+            "getter",
+            "deleter",
+        }:
             return "property accessor groups are not transformable"
     return None
 
@@ -324,25 +334,68 @@ def _resolve_nodes(
             )
         symbols_seen.add(target.symbol)
         candidates = by_name.get(target.symbol, [])
+        scanned_matches = [
+            item for item in scanner.definitions if item.qualified_name == target.symbol
+        ]
+        candidate_functions = [
+            item.node for item in candidates if item.kind == "function"
+        ]
+        all_matching_functions = candidate_functions + [
+            item.node
+            for item in scanned_matches
+            if all(item.node is not candidate for candidate in candidate_functions)
+        ]
+        decorator_error = next(
+            (
+                error
+                for function in all_matching_functions
+                if (error := _unsupported_decorator(function)) is not None
+            ),
+            None,
+        )
+        if decorator_error:
+            code = (
+                "unsupported_overload"
+                if "overload" in decorator_error
+                else "unsupported_property"
+            )
+            raise TransformError(
+                code,
+                f"target {target.symbol!r}: {decorator_error}",
+                target=target,
+            )
         if len(candidates) > 1:
             raise TransformError(
                 "duplicate_definition",
                 f"target {target.symbol!r} has {len(candidates)} lexical definitions",
                 target=target,
             )
+        if len(scanned_matches) > 1:
+            if any(item.conditional_depth > 0 for item in scanned_matches):
+                raise TransformError(
+                    "conditional_definition",
+                    f"target {target.symbol!r} has a definition inside a conditional or compound block",
+                    target=target,
+                )
+            if any(item.function_depth > 0 for item in scanned_matches):
+                raise TransformError(
+                    "local_target",
+                    f"target {target.symbol!r} has a definition inside another function",
+                    target=target,
+                )
+            raise TransformError(
+                "duplicate_definition",
+                f"target {target.symbol!r} has {len(scanned_matches)} lexical definitions",
+                target=target,
+            )
         if not candidates:
-            hidden = [
-                item
-                for item in scanner.definitions
-                if item.qualified_name == target.symbol
-            ]
-            if any(item.function_depth > 0 for item in hidden):
+            if any(item.function_depth > 0 for item in scanned_matches):
                 code = "local_target"
                 message = f"target {target.symbol!r} is defined inside another function"
-            elif any(item.conditional_depth > 0 for item in hidden):
+            elif any(item.conditional_depth > 0 for item in scanned_matches):
                 code = "conditional_definition"
                 message = f"target {target.symbol!r} is defined inside a conditional or compound block"
-            elif hidden:
+            elif scanned_matches:
                 code = "unsupported_target_scope"
                 message = (
                     f"target {target.symbol!r} is not a direct module/class definition"
@@ -359,18 +412,6 @@ def _resolve_nodes(
                 target=target,
             )
         function = definition.node
-        decorator_error = _unsupported_decorator(function)
-        if decorator_error:
-            code = (
-                "unsupported_overload"
-                if "overload" in decorator_error
-                else "unsupported_property"
-            )
-            raise TransformError(
-                code,
-                f"target {target.symbol!r}: {decorator_error}",
-                target=target,
-            )
         if _contains_yield(function):
             raise TransformError(
                 "unsupported_generator",
@@ -411,38 +452,53 @@ def resolve_targets(
     return tuple(resolved.values())
 
 
+def _docstring_expression(statement: cst.CSTNode) -> cst.Expr | None:
+    if isinstance(statement, cst.Expr):
+        expression = statement
+    elif isinstance(statement, (cst.SimpleStatementSuite, cst.SimpleStatementLine)):
+        body = statement.body
+        if not body or not isinstance(body[0], cst.Expr):
+            return None
+        expression = body[0]
+    else:
+        return None
+    if not isinstance(expression.value, cst.SimpleString):
+        return None
+    return expression
+
+
 def _is_docstring_statement(statement: cst.CSTNode) -> bool:
-    if not isinstance(statement, cst.SimpleStatementLine) or len(statement.body) != 1:
-        return False
-    small_statement = statement.body[0]
-    return isinstance(small_statement, cst.Expr) and isinstance(
-        small_statement.value, cst.SimpleString
-    )
+    return _docstring_expression(statement) is not None
 
 
 def _original_docstring(suite: cst.BaseSuite) -> cst.SimpleStatementLine | None:
     body = _suite_body(suite)
     if not body or not _is_docstring_statement(body[0]):
         return None
-    first = body[0]
-    assert isinstance(first, cst.SimpleStatementLine)
+    expression = _docstring_expression(body[0])
+    assert expression is not None
     # Rebuild the line to remove comments/whitespace owned by the solution
     # suite while preserving the exact string literal spelling.
-    return cst.SimpleStatementLine(body=[first.body[0]])
+    return cst.SimpleStatementLine(
+        body=[expression.with_changes(semicolon=cst.MaybeSentinel.DEFAULT)]
+    )
 
 
 def _scaffold_statements(
-    body: str | None, *, asynchronous: bool, exercise_id: str
+    body: str | None, *, asynchronous: bool, target: TransformTarget
 ) -> tuple[cst.CSTNode, ...]:
     if body is None:
-        statement = cst.parse_statement(
-            f'raise NotImplementedError("Exercise {exercise_id} is not implemented")'
+        message_literal = json.dumps(
+            f"Exercise {target.exercise_id} is not implemented",
+            ensure_ascii=True,
         )
+        statement = cst.parse_statement(f"raise NotImplementedError({message_literal})")
         return (statement,)
     if not body.strip():
         raise TransformError(
             "empty_scaffold",
             "custom scaffold body must contain at least one statement",
+            target=target,
         )
     indented_body = textwrap.indent(body.rstrip("\n"), "    ")
     prefix = "async " if asynchronous else ""
@@ -459,6 +515,7 @@ def _scaffold_statements(
         raise TransformError(
             "scaffold_docstring",
             "custom scaffold must not start with a docstring; docstring policy is separate",
+            target=target,
         )
     return statements
 
@@ -472,7 +529,7 @@ def _replacement_suite(
             _scaffold_statements(
                 target.body,
                 asynchronous=original.asynchronous is not None,
-                exercise_id=target.exercise_id,
+                target=target,
             )
         )
     except cst.ParserSyntaxError as exc:
@@ -570,9 +627,59 @@ def transform_file(
             "transformed_parse_error",
             f"transformed source for {path} did not reparse: {exc}",
         ) from exc
+    try:
+        compile(transformed_source, str(path), "exec", dont_inherit=True)
+    except SyntaxError as exc:  # pragma: no cover - defensive invariant
+        raise TransformError(
+            "transformed_compile_error",
+            f"transformed source for {path} did not compile: {exc}",
+        ) from exc
     transformed = _encode_source(transformed_source, encoding)
     final_targets = resolve_targets(transformed_source, list(target_tuple))
     return TransformResult(path, original, transformed, final_targets)
+
+
+def _safe_source_path(root: Path, relative_path: str) -> Path:
+    """Resolve a project-relative source while inspecting every component."""
+
+    path = root.joinpath(*relative_path.split("/"))
+    current = root
+    parts = relative_path.split("/")
+    for index, part in enumerate(parts):
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(info.st_mode):
+            raise TransformError(
+                "symlink_source",
+                f"source path must not contain a symlink component: {current}",
+            )
+        is_final = index == len(parts) - 1
+        if not is_final and not stat.S_ISDIR(info.st_mode):
+            raise TransformError(
+                "source_not_directory",
+                f"source path component is not a directory: {current}",
+            )
+        if is_final and not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise TransformError(
+                "special_source",
+                f"source path is not an ordinary file or directory: {current}",
+            )
+    return path
+
+
+def _path_group_key(root: Path, relative_path: str) -> tuple[str, ...]:
+    """Group aliases according to the actual filesystem and platform rules."""
+
+    path = root.joinpath(*relative_path.split("/"))
+    try:
+        info = path.stat()
+    except OSError:
+        normalized = os.path.normcase(os.fspath(path))
+        return ("path", normalized)
+    return ("file", str(info.st_dev), str(info.st_ino))
 
 
 def transform_sources(
@@ -589,17 +696,22 @@ def transform_sources(
     touched, preserving their bytes exactly.
     """
 
-    grouped: defaultdict[str, list[TransformTarget]] = defaultdict(list)
+    grouped: dict[tuple[str, ...], tuple[str, list[TransformTarget]]] = {}
     for relative_path, target in targets:
-        grouped[relative_path].append(target)
-    results: dict[Path, TransformResult] = {}
-    for relative_path, file_targets in grouped.items():
         if not is_safe_relative_path(relative_path):
             raise TransformError(
                 "unsafe_path",
                 f"source path must be a safe project-relative path: {relative_path!r}",
+                target=target,
             )
-        path = root.joinpath(*relative_path.split("/"))
+        _safe_source_path(root, relative_path)
+        key = _path_group_key(root, relative_path)
+        if key not in grouped:
+            grouped[key] = (relative_path, [])
+        grouped[key][1].append(target)
+    results: dict[Path, TransformResult] = {}
+    for relative_path, file_targets in grouped.values():
+        path = _safe_source_path(root, relative_path)
         result = transform_file(path, file_targets)
         results[path] = result
     if write:
