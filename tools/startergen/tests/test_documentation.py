@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+import startergen.documentation as documentation
 from startergen.cli import main
 from startergen.documentation import DocumentationError, build_documentation
 
@@ -43,6 +44,179 @@ def test_documentation_build_covers_student_and_site_outputs(tmp_path: Path) -> 
     )
     manifest_paths = {entry["path"] for entry in manifest["files"]}
     assert {"README.md", "assets/lab-diagram.svg"} <= manifest_paths
+
+
+def test_nested_assets_and_protected_asset_examples_are_preserved(tmp_path: Path) -> None:
+    project = copy_fixture(tmp_path)
+    nested = project / "teaching" / "assets" / "figures" / "plot.svg"
+    nested.parent.mkdir()
+    nested.write_text("<svg/>", encoding="utf-8")
+    (project / "teaching" / "project.md").write_text(
+        """# Asset page
+
+![Nested plot](assets/figures/plot.svg)
+
+```markdown
+![Literal example](assets/not-copied.svg)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = build_documentation(project)
+    readme = result.readme.read_text(encoding="utf-8")
+    site = (result.site / "index.md").read_text(encoding="utf-8")
+    assert "assets/figures/plot.svg" in readme
+    assert "assets/figures/plot.svg" in site
+    assert (result.readme.parent / "assets" / "figures" / "plot.svg").is_file()
+    assert "assets/not-copied.svg" in readme
+
+
+def test_allowlisted_assets_are_merged_without_loss(tmp_path: Path) -> None:
+    project = copy_fixture(tmp_path)
+    existing = project / "assets" / "student-data.txt"
+    existing.parent.mkdir()
+    existing.write_text("student asset\n", encoding="utf-8")
+    config = project / "teaching" / "config.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "    - examples\n", "    - examples\n    - assets\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = build_documentation(project)
+
+    assert (result.readme.parent / "assets" / "student-data.txt").read_text(
+        encoding="utf-8"
+    ) == "student asset\n"
+    assert (result.readme.parent / "assets" / "lab-diagram.svg").is_file()
+
+
+def test_asset_collision_rolls_back_the_previous_starter(tmp_path: Path) -> None:
+    project = copy_fixture(tmp_path)
+    previous = build_documentation(project)
+    previous_readme = previous.readme.read_bytes()
+    previous_index = previous.generated_source.joinpath("exercises.json").read_bytes()
+    existing = project / "assets" / "lab-diagram.svg"
+    existing.parent.mkdir()
+    existing.write_text("<svg>different</svg>\n", encoding="utf-8")
+    config = project / "teaching" / "config.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "    - examples\n", "    - examples\n    - assets\n"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DocumentationError) as error:
+        build_documentation(project)
+
+    assert error.value.code == "artifact_collision"
+    assert previous.readme.read_bytes() == previous_readme
+    assert previous.generated_source.joinpath("exercises.json").read_bytes() == previous_index
+
+
+def test_background_and_starter_links_are_rewritten_per_output(tmp_path: Path) -> None:
+    project = copy_fixture(tmp_path)
+    background = project / "teaching" / "background" / "theory.md"
+    background.write_text("# Theory\n\nBackground material.\n", encoding="utf-8")
+    source = project / "teaching" / "project.md"
+    source.write_text(
+        source.read_text(encoding="utf-8")
+        + "\n[Theory](background/theory.md)\n"
+        + "[Implementation](../src/lab_project/dynamics/unicycle.py)\n",
+        encoding="utf-8",
+    )
+
+    result = build_documentation(project)
+    readme = result.readme.read_text(encoding="utf-8")
+    site = (result.site / "index.md").read_text(encoding="utf-8")
+    assert "[Theory](background/theory.md)" in readme
+    assert "[Theory](background/theory.md)" in site
+    assert "[Implementation](src/lab_project/dynamics/unicycle.py)" in readme
+    assert "[Implementation](source/src/lab_project/dynamics/unicycle.py)" in site
+    assert (result.readme.parent / "background" / "theory.md").is_file()
+    assert (result.site / "background" / "theory.md").is_file()
+
+
+def test_unsupported_admonition_and_unclosed_inline_math_are_rejected(tmp_path: Path) -> None:
+    project = copy_fixture(tmp_path)
+    source = project / "teaching" / "project.md"
+    source.write_text("# Page\n\n!!! danger\n    Do not use this.\n", encoding="utf-8")
+    with pytest.raises(DocumentationError) as admonition:
+        build_documentation(project)
+    assert admonition.value.diagnostics[0].code == "unsupported_markdown"
+
+    source.write_text("# Page\n\nUnclosed $x.\n", encoding="utf-8")
+    with pytest.raises(DocumentationError) as math:
+        build_documentation(project)
+    assert math.value.diagnostics[0].code == "unclosed_math"
+    assert math.value.diagnostics[0].line == 3
+
+
+def test_mailto_is_not_sent_to_http_external_checker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = copy_fixture(tmp_path)
+    source = project / "teaching" / "project.md"
+    source.write_text("# Page\n\n[Contact](mailto:teacher@example.com)\n", encoding="utf-8")
+    monkeypatch.setattr(
+        documentation,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("mailto should not be checked as HTTP"),
+    )
+
+    build_documentation(project, check_external_links=True)
+
+
+def test_inline_code_formatting_stays_literal_in_site_preview(tmp_path: Path) -> None:
+    project = copy_fixture(tmp_path)
+    (project / "teaching" / "project.md").write_text(
+        "# Page\n\nUse `**literal**` and $x$.\n", encoding="utf-8"
+    )
+
+    result = build_documentation(project)
+    site_html = (result.site / "index.html").read_text(encoding="utf-8")
+    assert "<code>**literal**</code>" in site_html
+    assert "<code><strong>literal</strong></code>" not in site_html
+
+
+def test_failed_directory_promotion_restores_previous_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "site"
+    destination.mkdir()
+    (destination / "old.txt").write_text("old\n", encoding="utf-8")
+    real_rename = Path.rename
+
+    def fail_new_promotion(self: Path, target: str | Path) -> Path:
+        if self.name.startswith(".site-") and Path(target) == destination:
+            raise OSError("simulated promotion failure")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fail_new_promotion)
+    with pytest.raises(OSError):
+        documentation._replace_directory(
+            destination,
+            lambda path: (path / "new.txt").write_text("new\n", encoding="utf-8"),
+        )
+
+    assert (destination / "old.txt").read_text(encoding="utf-8") == "old\n"
+    assert not (destination / "new.txt").exists()
+
+
+def test_docs_cli_reports_assembly_failures_as_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    project = copy_fixture(tmp_path)
+    (project / "src" / "lab_project" / "dynamics" / "unicycle.py").write_text(
+        "class (\n", encoding="utf-8"
+    )
+
+    assert main(["docs", "--root", str(project), "--json"]) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["built"] is False
+    assert payload["code"] == "source_parse_error"
 
 
 def test_directives_inside_fences_and_math_are_literal(tmp_path: Path) -> None:

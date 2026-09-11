@@ -53,11 +53,20 @@ tree, `index.md`, `index.html`, and a small MathJax configuration file. Output
 directories are replaced through temporary siblings so a failed site write
 does not leave a partially generated directory.
 
+## Browser release acceptance
+
+The representative fixture was served from the generated `build/site` tree and
+opened in a browser. The acceptance page visibly contained the exercise link,
+the note admonition, a loaded SVG image, inline math, the display matrix, and
+the literal fenced exercise directive. The browser DOM confirmed one loaded
+image, one admonition, two MathJax-rendered math containers, and the literal
+fenced directive text. The observed acceptance record is kept in
+[`ISSUE_4_BROWSER_ACCEPTANCE.md`](ISSUE_4_BROWSER_ACCEPTANCE.md).
+
 ## Deliberate non-goals
 
-- This milestone does not run a browser or publish to a remote hosting
-  service. The static HTML preview and fixture page provide the release
-  acceptance surface for a later browser-based check.
+- This milestone does not publish to a remote hosting service. Browser
+  acceptance is performed against the generated local site tree.
 - The Markdown renderer is not a general CommonMark implementation. Adding a
   new extension requires an explicit parser rule and regression coverage.
 - External link checking is opt-in because a normal build must be reproducible

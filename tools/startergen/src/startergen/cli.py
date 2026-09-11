@@ -100,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
             result = build_documentation(
                 args.root, check_external_links=args.check_external_links
             )
-        except DocumentationError as exc:
+        except (DocumentationError, AssemblyError) as exc:
             if args.json:
                 print(
                     json.dumps(
