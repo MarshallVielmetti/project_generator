@@ -67,6 +67,18 @@ def test_docstring_drop_and_custom_async_scaffold() -> None:
     compile(result, "compute.py", "exec")
 
 
+def test_multistatement_one_line_docstring_is_preserved_once() -> None:
+    source = 'def compute(): """Keep this docstring."""; return 1\n'
+    result = _transform_text(
+        source,
+        TransformTarget("compute", "compute", docstring="preserve"),
+    )
+    assert result.count('"""Keep this docstring."""') == 1
+    assert '"""Keep this docstring.""";' not in result
+    assert "NotImplementedError" in result
+    compile(result, "compute.py", "exec")
+
+
 def test_latin1_and_crlf_are_preserved(tmp_path: Path) -> None:
     path = tmp_path / "latin1.py"
     source = (
@@ -93,6 +105,45 @@ def test_transform_sources_rejects_unsafe_relative_paths(tmp_path: Path) -> None
             [("../outside.py", TransformTarget("bad", "f"))],
         )
     assert error.value.code == "unsafe_path"
+
+
+def test_transform_sources_rejects_symlinked_intermediate_component(
+    tmp_path: Path,
+) -> None:
+    real_directory = tmp_path / "real"
+    real_directory.mkdir()
+    source = real_directory / "source.py"
+    source.write_text("def f():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "alias").symlink_to(real_directory, target_is_directory=True)
+    with pytest.raises(TransformError) as error:
+        transform_sources(
+            tmp_path,
+            [("alias/source.py", TransformTarget("bad", "f"))],
+        )
+    assert error.value.code == "symlink_source"
+
+
+def test_case_aliases_are_grouped_on_case_insensitive_filesystems(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.py"
+    source.write_text(
+        "def first():\n    return 1\n\ndef second():\n    return 2\n",
+        encoding="utf-8",
+    )
+    alias = tmp_path / "SOURCE.py"
+    if not alias.exists() or not source.samefile(alias):
+        pytest.skip("test filesystem is case-sensitive")
+    results = transform_sources(
+        tmp_path,
+        [
+            ("source.py", TransformTarget("first", "first")),
+            ("SOURCE.py", TransformTarget("second", "second")),
+        ],
+    )
+    assert len(results) == 1
+    output = next(iter(results.values())).transformed.decode("utf-8")
+    assert output.count("NotImplementedError") == 2
 
 
 def test_empty_target_list_is_byte_for_byte_noop(tmp_path: Path) -> None:
@@ -156,7 +207,7 @@ def _transform_text_many(source: str, targets: list[TransformTarget]) -> str:
             "unsupported_property",
         ),
         (
-            "from typing import overload\n@overload\ndef f(value: int): ...\n",
+            "@typing_extensions.overload\ndef f(value: int): ...\n",
             "f",
             "unsupported_overload",
         ),
@@ -181,6 +232,30 @@ def test_nested_function_yield_does_not_reject_outer_target() -> None:
     assert resolved[0].qualified_name == "outer"
 
 
+def test_direct_and_conditional_duplicate_is_rejected() -> None:
+    source = """def f():
+    return 1
+if enabled:
+    def f():
+        return 2
+"""
+    with pytest.raises(TransformError) as error:
+        resolve_targets(source, [TransformTarget("bad", "f")])
+    assert error.value.code == "conditional_definition"
+
+
+def test_unicode_identifier_components_are_resolved() -> None:
+    source = """class École:
+    def étape(self):
+        return 1
+"""
+    result = _transform_text(
+        source,
+        TransformTarget("unicode", "École.étape"),
+    )
+    assert "NotImplementedError" in result
+
+
 def test_duplicate_target_specs_and_invalid_scaffold_are_rejected() -> None:
     with pytest.raises(TransformError, match="listed more than once"):
         _transform_text_many(
@@ -194,6 +269,15 @@ def test_duplicate_target_specs_and_invalid_scaffold_are_rejected() -> None:
         )
     assert error.value.code == "invalid_scaffold"
 
+    with pytest.raises(TransformError) as error:
+        _transform_text(
+            "def f():\n    return 1\n",
+            TransformTarget("empty", "f", body=""),
+        )
+    assert error.value.code == "empty_scaffold"
+    assert error.value.target is not None
+    assert error.value.target.exercise_id == "empty"
+
 
 def test_scaffold_docstring_is_rejected_as_a_separate_policy() -> None:
     with pytest.raises(TransformError) as error:
@@ -202,3 +286,26 @@ def test_scaffold_docstring_is_rejected_as_a_separate_policy() -> None:
             TransformTarget("bad", "f", body='"""not allowed"""\nreturn 1'),
         )
     assert error.value.code == "scaffold_docstring"
+    assert error.value.target is not None
+    assert error.value.target.exercise_id == "bad"
+
+
+def test_generated_stub_escapes_exercise_id_before_compiling() -> None:
+    exercise_id = 'quote" slash\\ newline\nmarker'
+    result = _transform_text(
+        "def f():\n    return 1\n",
+        TransformTarget(exercise_id, "f"),
+    )
+    compile(result, "escaped.py", "exec")
+    assert 'quote\\" slash' in result
+
+
+def test_decorator_group_is_specific_before_duplicate_definition() -> None:
+    source = """@typing_extensions.overload
+def f(value: int): ...
+@typing_extensions.overload
+def f(value: str): ...
+"""
+    with pytest.raises(TransformError) as error:
+        resolve_targets(source, [TransformTarget("overloaded", "f")])
+    assert error.value.code == "unsupported_overload"
