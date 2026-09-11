@@ -17,17 +17,22 @@ canonical repository wholesale.
 - `starter.exclude` removes exact paths and their descendants from an
   allowlisted directory. Built-in deny rules additionally omit repository
   metadata, virtual environments, caches, build/tooling directories,
-  instructor/private/generation material, and credential-like files.
+  teaching contracts, instructor/private/generation material, and
+  credential-like files.
 - Symlinks and special files are never followed or copied. Existing path
   components are checked with `lstat` before they are read or used as output
   parents, so the build cannot escape the canonical root or write through an
   output symlink.
+- Every directory prefix participates in collision detection, not only leaf
+  files. This catches duplicate output files and case-colliding parent
+  directories before different filesystems can produce different artifacts.
 
 ## Staging and recovery
 
 - Builds run below the owned `build/` root and take an exclusive lock at
-  `build/.startergen.lock`. The lock covers enumeration, transformation,
-  manifest creation, and promotion.
+  `build/.startergen.lock`. The lock path itself is no-follow validated and
+  cannot be selected as a destination. The lock covers enumeration,
+  transformation, manifest creation, and promotion.
 - A unique staging directory is created below `build/`. The previous output is
   renamed to a temporary backup only during promotion; the new tree is then
   renamed into place. If promotion fails, the backup is restored. Failures
@@ -35,6 +40,9 @@ canonical repository wholesale.
   successful output byte-for-byte.
 - The final output is replaced as a whole rather than updated in place. This
   prevents stale files from an older build from surviving a newer allowlist.
+- Cleanup of the old backup is best effort after the new output is committed;
+  if cleanup fails, the build still succeeds with the backup retained for
+  recovery rather than reporting failure after visible state has changed.
 
 ## Manifest and provenance
 
@@ -44,6 +52,9 @@ canonical repository wholesale.
 - The manifest itself is intentionally excluded from its `files` hash list so
   it does not self-reference. Input provenance records relative paths, sizes,
   and hashes for the two contracts and every allowlisted canonical input.
+  Contract bytes are parsed from the same snapshots that are hashed, and each
+  allowlisted source is copied while being hashed, so provenance describes the
+  bytes that entered staging rather than a later reread.
 - No absolute local paths, credentials, instructor mappings, transformation
   reports, or detailed validation reports are written into the distributable
   tree. Build diagnostics remain in the returned exception/report or CLI
@@ -52,8 +63,12 @@ canonical repository wholesale.
 ## Transformation integration
 
 - Each declared exercise source must be present in the allowlist. Exercise
-  targets are grouped by their copied relative source path and passed to the
+  targets are matched by their declared relative path, with case-only
+  normalization where the filesystem permits it, never by inode identity.
+  They are grouped by their copied relative source path and passed to the
   existing LibCST transformer inside staging.
+- Staged files are temporarily writable while transformation runs, then
+  their canonical mode bits are restored before the manifest is generated.
 - A transformation failure aborts before promotion and retains the previous
   artifact. The manifest hashes the transformed starter bytes, while input
   provenance hashes the original canonical bytes.
