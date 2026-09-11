@@ -1,0 +1,26 @@
+schema_version: 1
+project:
+  name: MVP Canonical Project
+  import_package: mvp_project
+starter:
+  output: build/starter
+  include:
+    - src/mvp_project
+    - tests/public
+    - tests/smoke
+    - pyproject.toml
+    - uv.lock
+    - LICENSE
+  exclude: []
+documentation:
+  source: teaching/project.md
+  assets: teaching/assets
+  background: teaching/background
+  readme_template: teaching/templates/README.md.j2
+  generated_source: build/docs-src
+  site_output: build/site
+publication:
+  starter_repository: example/mvp-starter
+  branch: main
+  release_id: v1
+  docs_base_url: https://example.com/mvp/
