@@ -608,12 +608,23 @@ def transform_file(
     target_tuple = tuple(targets)
     if not target_tuple:
         return TransformResult(path, original, original, ())
-    source, encoding = _decode_source(original)
+    try:
+        source, encoding = _decode_source(original)
+    except TransformError as exc:
+        if not target_tuple or exc.target is not None:
+            raise
+        raise TransformError(
+            exc.code,
+            str(exc),
+            target=target_tuple[0],
+        ) from exc
     try:
         module = cst.parse_module(source)
     except cst.ParserSyntaxError as exc:
         raise TransformError(
-            "source_parse_error", f"could not parse {path}: {exc}"
+            "source_parse_error",
+            f"could not parse {path}: {exc}",
+            target=target_tuple[0] if target_tuple else None,
         ) from exc
     wrapper = metadata.MetadataWrapper(module, unsafe_skip_copy=True)
     positions = wrapper.resolve(metadata.PositionProvider)
