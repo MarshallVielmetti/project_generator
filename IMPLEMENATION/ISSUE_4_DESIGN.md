@@ -34,6 +34,13 @@ human-readable index links to the exact serialized file and displays both its
 qualified symbol and `path:start-end` context. This avoids deriving links from
 pre-transform source positions.
 
+The generated source and static-site trees retain the raw source files and add
+`<path>.html` source views with `L7` single-line anchors and `L7-L8` range
+anchors. Exercise links in the static site use those HTML views, so a browser
+can land on the documented final range instead of opening an unanchored raw
+text file. README links continue to target the generated starter files directly
+because GitHub provides the corresponding code-view range behavior.
+
 The starter manifest is refreshed after README and asset generation, while the
 generated-source and site trees remain separate outputs under their configured
 `build/` destinations.
@@ -49,9 +56,12 @@ network access. Public HTTP(S) links are collected separately and are checked
 only when `--check-external-links` is requested.
 
 Generated site assets include the teaching asset tree, background tree, source
-tree, `index.md`, `index.html`, and a small MathJax configuration file. Output
-directories are replaced through temporary siblings so a failed site write
-does not leave a partially generated directory.
+tree, line-anchored source HTML views, `index.md`, `index.html`, and a small
+MathJax configuration file. The documentation transaction holds the same
+`.startergen.lock` used by starter assembly from its final build through all
+README, manifest, and site promotions. Output directories are replaced through
+temporary siblings so a failed site write does not leave a partially generated
+directory or erase an output created by a concurrent build.
 
 ## Browser release acceptance
 

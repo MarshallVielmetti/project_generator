@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Self
 
 import pytest
-import startergen.documentation as documentation
+from startergen import documentation
 from startergen.cli import main
 from startergen.documentation import DocumentationError, build_documentation
 
@@ -32,7 +34,12 @@ def test_documentation_build_covers_student_and_site_outputs(tmp_path: Path) -> 
     assert "> **Note — Learning goal**" in readme
     assert "!!! note" not in readme
     assert (result.readme.parent / "assets" / "lab-diagram.svg").is_file()
-    assert "https://example.com/minimal-lab/v1/source/src/lab_project/dynamics/unicycle.py#L7-L8" in site_markdown
+    assert "https://example.com/minimal-lab/v1/source/src/lab_project/dynamics/unicycle.py.html#L7-L8" in site_markdown
+    source_page = result.site / "source/src/lab_project/dynamics/unicycle.py.html"
+    assert source_page.is_file()
+    source_page_text = source_page.read_text(encoding="utf-8")
+    assert 'id="L7-L8"' in source_page_text
+    assert 'id="L7"' in source_page_text
     assert "https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js" in site_html
     assert '<aside class="admonition note">' in site_html
     assert '<div class="arithmatex">\\[' in site_html
@@ -121,10 +128,13 @@ def test_background_and_starter_links_are_rewritten_per_output(tmp_path: Path) -
     project = copy_fixture(tmp_path)
     background = project / "teaching" / "background" / "theory.md"
     background.write_text("# Theory\n\nBackground material.\n", encoding="utf-8")
+    data = project / "teaching" / "background" / "data.csv"
+    data.write_text("x,y\n1,2\n", encoding="utf-8")
     source = project / "teaching" / "project.md"
     source.write_text(
         source.read_text(encoding="utf-8")
         + "\n[Theory](background/theory.md)\n"
+        + "[Data](background/data.csv?download=1)\n"
         + "[Implementation](../src/lab_project/dynamics/unicycle.py)\n",
         encoding="utf-8",
     )
@@ -134,6 +144,8 @@ def test_background_and_starter_links_are_rewritten_per_output(tmp_path: Path) -
     site = (result.site / "index.md").read_text(encoding="utf-8")
     assert "[Theory](background/theory.md)" in readme
     assert "[Theory](background/theory.md)" in site
+    assert "[Data](background/data.csv?download=1)" in readme
+    assert "[Data](background/data.csv?download=1)" in site
     assert "[Implementation](src/lab_project/dynamics/unicycle.py)" in readme
     assert "[Implementation](source/src/lab_project/dynamics/unicycle.py)" in site
     assert (result.readme.parent / "background" / "theory.md").is_file()
@@ -168,6 +180,83 @@ def test_mailto_is_not_sent_to_http_external_checker(
     )
 
     build_documentation(project, check_external_links=True)
+
+
+def test_external_link_checker_retries_get_when_head_is_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = copy_fixture(tmp_path)
+    source = project / "teaching" / "project.md"
+    source.write_text("# Page\n\n[Docs](https://example.com/download)\n", encoding="utf-8")
+    methods: list[str] = []
+
+    class Response:
+        def __init__(self, status: int) -> None:
+            self.status = status
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def fake_urlopen(request: object, *, timeout: int) -> Response:
+        del timeout
+        method = request.get_method()  # type: ignore[attr-defined]
+        methods.append(method)
+        return Response(405 if method == "HEAD" else 200)
+
+    monkeypatch.setattr(documentation, "urlopen", fake_urlopen)
+
+    build_documentation(project, check_external_links=True)
+
+    assert methods == ["HEAD", "GET"]
+
+
+def test_documentation_transaction_keeps_shared_lock_while_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = copy_fixture(tmp_path)
+    active = False
+    observed: list[str] = []
+
+    @contextmanager
+    def fake_lock(root: Path):
+        nonlocal active
+        del root
+        active = True
+        observed.append("enter")
+        try:
+            yield
+        finally:
+            active = False
+            observed.append("exit")
+
+    real_build = documentation.build_project_locked
+
+    def fake_build(root: Path):
+        assert active
+        observed.append("build")
+        return real_build(root)
+
+    real_replace = documentation._replace_directory
+
+    def checked_replace(path: Path, writer: object) -> None:
+        assert active
+        observed.append(f"replace:{path.name}")
+        real_replace(path, writer)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(documentation, "project_build_lock", fake_lock)
+    monkeypatch.setattr(documentation, "build_project_locked", fake_build)
+    monkeypatch.setattr(documentation, "_replace_directory", checked_replace)
+
+    build_documentation(project)
+
+    assert observed[0] == "enter"
+    assert observed[-1] == "exit"
+    assert "build" in observed
+    assert "replace:docs-src" in observed
+    assert "replace:site" in observed
 
 
 def test_inline_code_formatting_stays_literal_in_site_preview(tmp_path: Path) -> None:

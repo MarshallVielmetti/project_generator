@@ -31,7 +31,11 @@ from urllib.request import Request, urlopen
 from jinja2 import Environment, StrictUndefined, TemplateError
 from pydantic import ValidationError
 
-from startergen.assembly import BuildResult, build_project
+from startergen.assembly import (
+    BuildResult,
+    build_project_locked,
+    project_build_lock,
+)
 from startergen.diagnostics import Diagnostic
 from startergen.paths import project_path
 from startergen.schema import Exercise, ExerciseMetadata, ProjectMetadata
@@ -368,11 +372,11 @@ def _exercise_links(
         encoded_source = quote(source, safe="/._-")
         readme_href = f"{encoded_source}#L{start}-L{end}"
         if publication is None:
-            site_href = f"source/{encoded_source}#L{start}-L{end}"
+            site_href = f"source/{encoded_source}.html#L{start}-L{end}"
         else:
             base = publication.docs_base_url.rstrip("/")
             site_href = (
-                f"{base}/{publication.release_id}/source/{encoded_source}"
+                f"{base}/{publication.release_id}/source/{encoded_source}.html"
                 f"#L{start}-L{end}"
             )
         links.append(
@@ -408,7 +412,7 @@ def _placeholder_links(exercises: ExerciseMetadata) -> tuple[ExerciseLink, ...]:
             start_line=0,
             end_line=0,
             readme_href=f"{quote(exercise.source.file, safe='/._-')}#L0-L0",
-            site_href=f"source/{quote(exercise.source.file, safe='/._-')}#L0-L0",
+            site_href=f"source/{quote(exercise.source.file, safe='/._-')}.html#L0-L0",
         )
         for exercise in exercises.exercises
     )
@@ -437,8 +441,9 @@ def _validate_references(
         parsed_href = urlparse(reference.href)
         if parsed_href.scheme in {"http", "https", "mailto"}:
             continue
-        path_part, separator, fragment = reference.href.partition("#")
-        if not path_part and separator:
+        path_part = parsed_href.path
+        fragment = parsed_href.fragment
+        if not path_part:
             if fragment and fragment not in parsed.headings:
                 diagnostics.append(
                     Diagnostic(
@@ -883,7 +888,7 @@ def render_site(source_markdown: str, *, title: str) -> tuple[str, str]:
         fence_match = _FENCE.match(line)
         if fence is not None:
             if fence_match and fence_match.group("mark")[0] == fence[0]:
-                output.append(f"</code></pre>")
+                output.append("</code></pre>")
                 fence = None
             else:
                 output.append(html.escape(line))
@@ -1053,6 +1058,74 @@ def _copy_artifact_source(starter: Path, destination: Path) -> None:
             shutil.copy2(path, target)
 
 
+def _render_source_html(
+    source: Path, *, ranges: Sequence[tuple[int, int]], title: str
+) -> str:
+    """Render a source file with stable single-line and range anchors."""
+
+    lines = source.read_text(encoding="utf-8").splitlines()
+    ranges_by_start: dict[int, list[tuple[int, int]]] = {}
+    for start, end in ranges:
+        if start > 0 and end >= start:
+            ranges_by_start.setdefault(start, []).append((start, end))
+    rendered: list[str] = []
+    for number, line in enumerate(lines, start=1):
+        range_anchors = "".join(
+            f'<a id="L{start}-L{end}"></a>'
+            for start, end in ranges_by_start.get(number, ())
+        )
+        rendered.append(
+            f'{range_anchors}<span class="line" id="L{number}">'
+            f'<a class="line-number" href="#L{number}">{number}</a>'
+            f"{html.escape(line, quote=False)}</span>"
+        )
+    body = "\n".join(rendered)
+    return (
+        "<!doctype html>\n"
+        '<html lang="en"><head><meta charset="utf-8">'
+        f"<title>{html.escape(title)}</title>"
+        "<style>"
+        "body{margin:0;background:#f7f7f7;color:#222;font:14px/1.5 monospace;}"
+        "pre{margin:0;padding:1rem;overflow:auto;}"
+        ".line{display:block;min-width:max-content;padding-right:2rem;}"
+        ".line:target{background:#fff2a8;}"
+        ".line-number{display:inline-block;width:4rem;margin-right:1rem;"
+        "color:#777;text-align:right;text-decoration:none;user-select:none;}"
+        "a[id^=L]{display:block;position:relative;top:-1rem;}"
+        "</style></head><body><pre>"
+        f"{body}\n"
+        "</pre></body></html>\n"
+    )
+
+
+def _copy_anchored_sources(
+    starter: Path, destination: Path, links: Sequence[ExerciseLink]
+) -> None:
+    """Copy raw sources and line-anchored pages used by generated indexes."""
+
+    _copy_artifact_source(starter, destination)
+    ranges_by_source: dict[str, list[tuple[int, int]]] = {}
+    for link in links:
+        ranges_by_source.setdefault(link.source_path, []).append(
+            (link.start_line, link.end_line)
+        )
+    for relative, ranges in ranges_by_source.items():
+        source = starter.joinpath(*relative.split("/"))
+        if not source.is_file():
+            raise DocumentationError(
+                "missing_final_source_target",
+                f"final source file is missing from the generated artifact: {relative}",
+            )
+        page = destination.joinpath(*relative.split("/")).with_name(
+            f"{source.name}.html"
+        )
+        page.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        page.write_text(
+            _render_source_html(source, ranges=ranges, title=relative),
+            encoding="utf-8",
+        )
+
+
 def _replace_directory(path: Path, writer: Callable[[Path], None]) -> None:
     path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{path.name}-", dir=path.parent))
@@ -1119,10 +1192,26 @@ def _check_external_links(urls: Sequence[str], *, source_file: str) -> None:
     for url in urls:
         try:
             request = Request(url, method="HEAD", headers={"User-Agent": "startergen"})
-            with urlopen(request, timeout=10) as response:
-                if response.status >= 400:
-                    raise OSError(f"HTTP {response.status}")
-        except Exception as exc:
+            try:
+                with urlopen(request, timeout=10) as response:
+                    status = response.status
+            except (OSError, ValueError) as exc:
+                status = getattr(exc, "code", None)
+                if status not in {405, 501}:
+                    raise
+            if status in {405, 501}:
+                request = Request(
+                    url,
+                    method="GET",
+                    headers={"Range": "bytes=0-0", "User-Agent": "startergen"},
+                )
+                with urlopen(request, timeout=10) as response:
+                    status = response.status
+                    if status >= 400:
+                        raise OSError(f"HTTP {status}")
+            elif status >= 400:
+                raise OSError(f"HTTP {status}")
+        except (OSError, ValueError) as exc:
             diagnostics.append(
                 Diagnostic(
                     "external_link_failed",
@@ -1204,13 +1293,19 @@ def build_documentation(
     starter_output = project_path(root, config.starter.output)
     assert starter_output is not None
     output_paths = (starter_output, generated_source, site)
+    lock = project_build_lock(root)
+    lock.__enter__()
     snapshots: dict[Path, Path | None] = {}
-    for output_path in output_paths:
-        output_path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-        snapshots[output_path] = _snapshot_directory(output_path)
+    try:
+        for output_path in output_paths:
+            output_path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            snapshots[output_path] = _snapshot_directory(output_path)
+    except BaseException:
+        lock.__exit__(None, None, None)
+        raise
 
     try:
-        result = build_result or build_project(root)
+        result = build_result or build_project_locked(root)
         links = _exercise_links(config, exercises, result)
         readme_source = _rewrite_local_links(
             source_markdown,
@@ -1257,7 +1352,7 @@ def build_documentation(
         _refresh_manifest(result)
 
         def write_generated(destination: Path) -> None:
-            _copy_artifact_source(result.output, destination / "source")
+            _copy_anchored_sources(result.output, destination / "source", links)
             (destination / "exercises.json").write_text(
                 json.dumps(
                     {"schema_version": 1, "exercises": [link.to_dict() for link in links]},
@@ -1271,7 +1366,7 @@ def build_documentation(
             for link in links:
                 encoded_source = quote(link.source_path, safe="/._-")
                 index_lines.append(
-                    f"- [{link.title} — `{link.symbol}`](source/{encoded_source}"
+                    f"- [{link.title} — `{link.symbol}`](source/{encoded_source}.html"
                     f"#L{link.start_line}-L{link.end_line}) "
                     f"({link.source_path}:{link.start_line}-{link.end_line})"
                 )
@@ -1280,7 +1375,7 @@ def build_documentation(
             )
 
         def write_site(destination: Path) -> None:
-            _copy_artifact_source(result.output, destination / "source")
+            _copy_anchored_sources(result.output, destination / "source", links)
             _copy_tree(assets, destination / "assets")
             _copy_tree(background, destination / "background")
             (destination / "index.md").write_text(site_markdown, encoding="utf-8")
@@ -1306,6 +1401,7 @@ def build_documentation(
         for snapshot in snapshots.values():
             if snapshot is not None and snapshot.exists():
                 shutil.rmtree(snapshot)
+        lock.__exit__(None, None, None)
 
 
 generate_documentation = build_documentation

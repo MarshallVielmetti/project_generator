@@ -55,8 +55,9 @@ Teaching Markdown supports headings, links, images, fenced code, inline or
 display math, `!!! note`/`!!! warning` admonitions, and standalone
 `{{ exercise("id") }}` directives. Directives are ignored inside fenced code,
 inline code, and math. README links point into the generated starter tree;
-site links use `publication.release_id` and the configured documentation base
-URL. Local references are checked offline; public links are checked only when
+site links use line-anchored generated source HTML below
+`publication.release_id` and the configured documentation base URL. Local
+references are checked offline; public links are checked only when
 `--check-external-links` is supplied.
 
 The issue #4 design record is in

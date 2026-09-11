@@ -10,6 +10,7 @@ import stat
 import tempfile
 import uuid
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -470,6 +471,18 @@ class _BuildLock:
         self.handle.close()
 
 
+@contextmanager
+def project_build_lock(root: Path) -> Iterator[None]:
+    """Hold the lock shared by starter and documentation builds."""
+
+    root = root.expanduser().resolve()
+    build_root = root / "build"
+    _assert_safe_existing_path(root, build_root)
+    build_root.mkdir(mode=0o755, parents=True, exist_ok=True)
+    with _BuildLock(build_root / ".startergen.lock"):
+        yield
+
+
 def _resolve_output(root: Path, value: str) -> tuple[Path, Path]:
     output = project_path(root, value)
     build_root = root / "build"
@@ -645,10 +658,32 @@ def build_project(
         ) from exc
 
 
+def build_project_locked(
+    root: Path,
+    *,
+    generator_version: str = __version__,
+) -> BuildResult:
+    """Build a starter while the caller owns :func:`project_build_lock`."""
+
+    try:
+        return _build_project(
+            root, generator_version=generator_version, lock_held=True
+        )
+    except AssemblyError:
+        raise
+    except OSError as exc:
+        raise AssemblyError(
+            "filesystem_error",
+            "starter assembly could not access the filesystem",
+            cause=exc,
+        ) from exc
+
+
 def _build_project(
     root: Path,
     *,
     generator_version: str,
+    lock_held: bool = False,
 ) -> BuildResult:
 
     root = root.expanduser().resolve()
@@ -663,7 +698,8 @@ def _build_project(
     build_root, output = _resolve_output(root, config.starter.output)
     transformed_files: list[str] = []
     resolved_targets: list[ResolvedTarget] = []
-    with _BuildLock(build_root / ".startergen.lock"):
+    lock = nullcontext() if lock_held else _BuildLock(build_root / ".startergen.lock")
+    with lock:
         staging = Path(tempfile.mkdtemp(prefix=".startergen-stage-", dir=build_root))
         try:
             files = enumerate_allowlist(
