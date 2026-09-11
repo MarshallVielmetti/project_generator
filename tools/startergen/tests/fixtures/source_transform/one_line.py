@@ -1,2 +1,1 @@
-def one_line(value: int) -> int:
-    return value + 1
+def one_line(value: int) -> int: return value + 1
