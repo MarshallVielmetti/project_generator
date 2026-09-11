@@ -23,7 +23,7 @@ from startergen.paths import is_safe_relative_path, project_path
 from startergen.schema import ExerciseMetadata, ProjectMetadata
 from startergen.transform import TransformError, TransformTarget, transform_sources
 from startergen.validate import validate_project
-from startergen.yaml_io import YamlInputError, load_yaml
+from startergen.yaml_io import YamlInputError, load_yaml_bytes
 
 MANIFEST_SCHEMA_VERSION = 1
 
@@ -45,6 +45,7 @@ DENIED_PATH_COMPONENTS = frozenset(
         "generation",
         "instructor",
         "private",
+        "teaching",
         "tools",
     }
 )
@@ -115,6 +116,13 @@ class BuildResult:
             "files": [file.to_dict() for file in self.files],
             "transformed_files": list(self.transformed_files),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceSnapshot:
+    mode: int
+    size: int
+    sha256: str
 
 
 def deny_reason(relative_path: str) -> str | None:
@@ -261,7 +269,7 @@ def enumerate_allowlist(
             raise AssemblyError("unsafe_path", f"exclude path is unsafe: {value!r}")
         exclusions.append(_path_key(value))
     results: dict[str, Path] = {}
-    keys: dict[str, str] = {}
+    occupied: dict[str, tuple[str, bool]] = {}
     for value in include:
         if not is_safe_relative_path(value):
             raise AssemblyError("unsafe_path", f"include path is unsafe: {value!r}")
@@ -275,14 +283,26 @@ def enumerate_allowlist(
         for relative, source in _iter_input_files(
             root, path, exclusions=tuple(exclusions)
         ):
-            key = _path_key(relative)
-            previous = keys.get(key)
-            if previous is not None:
-                raise AssemblyError(
-                    "artifact_collision",
-                    f"allowlisted paths {previous!r} and {relative!r} produce the same output path",
-                )
-            keys[key] = relative
+            parts = relative.split("/")
+            for index in range(1, len(parts) + 1):
+                prefix = "/".join(parts[:index])
+                key = _path_key(prefix)
+                is_directory = index < len(parts)
+                previous = occupied.get(key)
+                if previous is not None:
+                    previous_path, previous_is_directory = previous
+                    if previous_path != prefix or previous_is_directory != is_directory:
+                        raise AssemblyError(
+                            "artifact_collision",
+                            f"allowlisted paths {previous_path!r} and {relative!r} collide in the publication tree",
+                        )
+                    if not is_directory:
+                        raise AssemblyError(
+                            "artifact_collision",
+                            f"allowlisted paths repeat the output file {relative!r}",
+                        )
+                else:
+                    occupied[key] = (prefix, is_directory)
             results[relative] = source
     return dict(sorted(results.items()))
 
@@ -324,14 +344,23 @@ def _artifact_files(root: Path) -> tuple[ArtifactFile, ...]:
     return tuple(entries)
 
 
+def _digest_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _input_provenance(
-    root: Path, contract_paths: tuple[Path, ...], files: dict[str, Path]
+    contract_records: Iterable[dict[str, Any]],
+    snapshots: dict[str, _SourceSnapshot],
 ) -> list[dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
-    for path in (*contract_paths, *files.values()):
-        relative = path.relative_to(root).as_posix()
-        digest, size = _sha256(path)
-        records[relative] = {"path": relative, "sha256": digest, "size": size}
+    for record in contract_records:
+        records[record["path"]] = dict(record)
+    for relative, snapshot in snapshots.items():
+        records[relative] = {
+            "path": relative,
+            "sha256": snapshot.sha256,
+            "size": snapshot.size,
+        }
     return [records[key] for key in sorted(records)]
 
 
@@ -376,16 +405,37 @@ class _BuildLock:
 
     def __enter__(self) -> Self:
         self.path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-        self.handle = self.path.open("a+")
-        if fcntl is not None:
-            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
-        else:  # pragma: no cover
-            import msvcrt
-
+        try:
+            info = self.path.lstat()
+        except FileNotFoundError:
+            info = None
+        if info is not None and (
+            stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+        ):
+            raise AssemblyError(
+                "unsafe_lock",
+                f"build lock is not an ordinary file: {self.path}",
+            )
+        try:
+            self.handle = self.path.open("a+b")
+            self.handle.seek(0, os.SEEK_END)
+            if self.handle.tell() == 0:
+                self.handle.write(b"0")
+                self.handle.flush()
             self.handle.seek(0)
-            self.handle.write(" ")
-            self.handle.flush()
-            msvcrt.locking(self.handle.fileno(), msvcrt.LK_LOCK, 1)
+            if fcntl is not None:
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+            else:  # pragma: no cover
+                import msvcrt
+
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError as exc:
+            if self.handle is not None:
+                self.handle.close()
+                self.handle = None
+            raise AssemblyError(
+                "lock_failed", f"could not acquire build lock: {self.path}", cause=exc
+            ) from exc
         return self
 
     def __exit__(
@@ -417,6 +467,11 @@ def _resolve_output(root: Path, value: str) -> tuple[Path, Path]:
         raise AssemblyError(
             "invalid_destination", "starter output cannot be build/ itself"
         )
+    if relative_to_build.parts[0].casefold() == ".startergen.lock":
+        raise AssemblyError(
+            "reserved_destination",
+            "starter output cannot use the internal build lock path",
+        )
     _assert_safe_existing_path(root, build_root)
     _assert_safe_existing_path(root, output)
     if output.exists() and not output.is_dir():
@@ -428,7 +483,8 @@ def _resolve_output(root: Path, value: str) -> tuple[Path, Path]:
     return build_root, output
 
 
-def _copy_files(files: dict[str, Path], staging: Path) -> None:
+def _copy_files(files: dict[str, Path], staging: Path) -> dict[str, _SourceSnapshot]:
+    snapshots: dict[str, _SourceSnapshot] = {}
     for relative, source in files.items():
         destination = staging.joinpath(*relative.split("/"))
         destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -437,23 +493,44 @@ def _copy_files(files: dict[str, Path], staging: Path) -> None:
             raise AssemblyError(
                 "special_input", f"allowlisted source is not a file: {relative}"
             )
-        shutil.copyfile(source, destination)
-        os.chmod(destination, stat.S_IMODE(source_info.st_mode))
+        digest = hashlib.sha256()
+        size = 0
+        with (
+            source.open("rb") as source_handle,
+            destination.open("wb") as output_handle,
+        ):
+            for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
+                output_handle.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+        source_mode = stat.S_IMODE(source_info.st_mode)
+        os.chmod(destination, source_mode | stat.S_IWUSR)
+        snapshots[relative] = _SourceSnapshot(
+            mode=source_mode,
+            size=size,
+            sha256=digest.hexdigest(),
+        )
+    return snapshots
 
 
-def _source_output_path(
-    root: Path, files: dict[str, Path], relative: str
-) -> str | None:
-    candidate = project_path(root, relative)
-    if candidate is None or not candidate.exists():
-        return None
-    for output_relative, source in files.items():
-        try:
-            if candidate.samefile(source):
-                return output_relative
-        except FileNotFoundError:
-            return None
-    return None
+def _restore_modes(staging: Path, snapshots: dict[str, _SourceSnapshot]) -> None:
+    for relative, snapshot in snapshots.items():
+        os.chmod(staging.joinpath(*relative.split("/")), snapshot.mode)
+
+
+def _source_output_path(files: dict[str, Path], relative: str) -> str | None:
+    if relative in files:
+        return relative
+    matches = [
+        output_relative
+        for output_relative in files
+        if len(output_relative.split("/")) == len(relative.split("/"))
+        and all(
+            actual.casefold() == declared.casefold()
+            for actual, declared in zip(output_relative.split("/"), relative.split("/"))
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _promote(staging: Path, output: Path, build_root: Path) -> None:
@@ -468,24 +545,65 @@ def _promote(staging: Path, output: Path, build_root: Path) -> None:
             backup.rename(output)
         raise
     if backup.exists():
-        shutil.rmtree(backup)
+        try:
+            shutil.rmtree(backup)
+        except OSError:
+            # Promotion has committed the new output. Retaining the backup is
+            # safer than reporting failure after the visible state changed.
+            pass
 
 
-def _load_contracts(root: Path) -> tuple[ProjectMetadata, ExerciseMetadata]:
+def _load_contracts(
+    root: Path,
+) -> tuple[ProjectMetadata, ExerciseMetadata, list[dict[str, Any]]]:
     try:
-        config = ProjectMetadata.model_validate(
-            load_yaml(root / "teaching" / "config.yml")
-        )
-        exercises = ExerciseMetadata.model_validate(
-            load_yaml(root / "teaching" / "exercises.yml")
-        )
+        records: list[dict[str, Any]] = []
+        models: list[Any] = []
+        for path, model in (
+            (root / "teaching" / "config.yml", ProjectMetadata),
+            (root / "teaching" / "exercises.yml", ExerciseMetadata),
+        ):
+            raw = path.read_bytes()
+            models.append(model.model_validate(load_yaml_bytes(raw)))
+            records.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "sha256": _digest_bytes(raw),
+                    "size": len(raw),
+                }
+            )
     except (YamlInputError, ValidationError) as exc:
         raise AssemblyError(
             "contract_load_failed",
             f"validated contracts could not be loaded: {exc}",
             cause=exc,
         ) from exc
-    return config, exercises
+    except OSError as exc:
+        raise AssemblyError(
+            "contract_read_failed", "validated contracts could not be read", cause=exc
+        ) from exc
+    return models[0], models[1], records
+
+
+def _normalized_transform_error(
+    error: TransformError,
+    target_pairs: list[tuple[str, TransformTarget]],
+) -> AssemblyError:
+    target = error.target
+    relative = target_pairs[0][0] if target_pairs else "source"
+    if target is not None:
+        for candidate_relative, candidate_target in target_pairs:
+            if candidate_target == target:
+                relative = candidate_relative
+                break
+        context = f" for exercise {target.exercise_id!r} target {target.symbol!r}"
+    else:
+        context = ""
+    return AssemblyError(
+        error.code,
+        f"could not transform {relative}{context}: {error.code}",
+        cause=error,
+    )
 
 
 def build_project(
@@ -495,6 +613,24 @@ def build_project(
 ) -> BuildResult:
     """Build and atomically promote a validated starter artifact."""
 
+    try:
+        return _build_project(root, generator_version=generator_version)
+    except AssemblyError:
+        raise
+    except OSError as exc:
+        raise AssemblyError(
+            "filesystem_error",
+            "starter assembly could not access the filesystem",
+            cause=exc,
+        ) from exc
+
+
+def _build_project(
+    root: Path,
+    *,
+    generator_version: str,
+) -> BuildResult:
+
     root = root.expanduser().resolve()
     report = validate_project(root)
     if not report.ok:
@@ -503,13 +639,8 @@ def build_project(
             "project validation failed; no artifact was changed",
             diagnostics=report.diagnostics,
         )
-    config, exercises = _load_contracts(root)
+    config, exercises, contract_provenance = _load_contracts(root)
     build_root, output = _resolve_output(root, config.starter.output)
-    contract_paths = (
-        root / "teaching" / "config.yml",
-        root / "teaching" / "exercises.yml",
-    )
-
     transformed_files: list[str] = []
     with _BuildLock(build_root / ".startergen.lock"):
         staging = Path(tempfile.mkdtemp(prefix=".startergen-stage-", dir=build_root))
@@ -517,12 +648,12 @@ def build_project(
             files = enumerate_allowlist(
                 root, config.starter.include, config.starter.exclude
             )
-            provenance = _input_provenance(root, contract_paths, files)
-            _copy_files(files, staging)
+            snapshots = _copy_files(files, staging)
+            provenance = _input_provenance(contract_provenance, snapshots)
 
             target_pairs: list[tuple[str, TransformTarget]] = []
             for exercise in exercises.exercises:
-                output_relative = _source_output_path(root, files, exercise.source.file)
+                output_relative = _source_output_path(files, exercise.source.file)
                 if output_relative is None:
                     raise AssemblyError(
                         "source_not_allowlisted",
@@ -544,16 +675,13 @@ def build_project(
                 try:
                     transformed = transform_sources(staging, target_pairs, write=True)
                 except TransformError as exc:
-                    raise AssemblyError(
-                        exc.code,
-                        str(exc),
-                        cause=exc,
-                    ) from exc
+                    raise _normalized_transform_error(exc, target_pairs) from exc
                 transformed_files.extend(
                     path.relative_to(staging).as_posix()
                     for path, result in transformed.items()
                     if result.changed
                 )
+            _restore_modes(staging, snapshots)
             _manifest_path, artifact_files = _write_manifest(
                 staging,
                 config=config,

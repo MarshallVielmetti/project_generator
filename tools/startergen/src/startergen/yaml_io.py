@@ -53,13 +53,9 @@ _StrictLoader.add_constructor(
 )
 
 
-def load_yaml(path: Path) -> Any:
-    """Load one YAML document without executing tags or accepting duplicates."""
+def load_yaml_text(text: str) -> Any:
+    """Load YAML text under the strict duplicate-key policy."""
 
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise YamlInputError(str(exc), code="yaml_read_error") from exc
     try:
         value = yaml.load(text, Loader=_StrictLoader)
     except YamlInputError:
@@ -72,3 +68,23 @@ def load_yaml(path: Path) -> Any:
     if value is None:
         raise YamlInputError("document is empty", code="empty_yaml")
     return value
+
+
+def load_yaml_bytes(raw: bytes) -> Any:
+    """Load one UTF-8 YAML snapshot without rereading its source path."""
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise YamlInputError(str(exc), code="yaml_decode_error") from exc
+    return load_yaml_text(text)
+
+
+def load_yaml(path: Path) -> Any:
+    """Load one YAML document without executing tags or accepting duplicates."""
+
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise YamlInputError(str(exc), code="yaml_read_error") from exc
+    return load_yaml_bytes(raw)
