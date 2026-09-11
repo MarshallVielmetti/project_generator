@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="80" viewBox="0 0 160 80" role="img" aria-label="Lab diagram">
+  <rect width="160" height="80" fill="#eef2ff"/>
+  <circle cx="42" cy="40" r="18" fill="#4f46e5"/>
+  <path d="M60 40h55m0 0-12-8m12 8-12 8" stroke="#111827" stroke-width="4" fill="none"/>
+</svg>

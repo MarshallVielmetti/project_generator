@@ -21,7 +21,12 @@ from startergen import __version__
 from startergen.diagnostics import Diagnostic
 from startergen.paths import is_safe_relative_path, project_path
 from startergen.schema import ExerciseMetadata, ProjectMetadata
-from startergen.transform import TransformError, TransformTarget, transform_sources
+from startergen.transform import (
+    ResolvedTarget,
+    TransformError,
+    TransformTarget,
+    transform_sources,
+)
 from startergen.validate import validate_project
 from startergen.yaml_io import YamlInputError, load_yaml_bytes
 
@@ -108,6 +113,7 @@ class BuildResult:
     manifest: Path
     files: tuple[ArtifactFile, ...]
     transformed_files: tuple[str, ...]
+    targets: tuple[ResolvedTarget, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +121,20 @@ class BuildResult:
             "manifest": self.manifest.as_posix(),
             "files": [file.to_dict() for file in self.files],
             "transformed_files": list(self.transformed_files),
+            "targets": [
+                {
+                    "exercise_id": target.target.exercise_id,
+                    "symbol": target.target.symbol,
+                    "qualified_name": target.qualified_name,
+                    "source_range": {
+                        "start_line": target.source_range.start_line,
+                        "start_column": target.source_range.start_column,
+                        "end_line": target.source_range.end_line,
+                        "end_column": target.source_range.end_column,
+                    },
+                }
+                for target in self.targets
+            ],
         }
 
 
@@ -642,6 +662,7 @@ def _build_project(
     config, exercises, contract_provenance = _load_contracts(root)
     build_root, output = _resolve_output(root, config.starter.output)
     transformed_files: list[str] = []
+    resolved_targets: list[ResolvedTarget] = []
     with _BuildLock(build_root / ".startergen.lock"):
         staging = Path(tempfile.mkdtemp(prefix=".startergen-stage-", dir=build_root))
         try:
@@ -681,6 +702,8 @@ def _build_project(
                     for path, result in transformed.items()
                     if result.changed
                 )
+                for result in transformed.values():
+                    resolved_targets.extend(result.targets)
             _restore_modes(staging, snapshots)
             _manifest_path, artifact_files = _write_manifest(
                 staging,
@@ -705,6 +728,7 @@ def _build_project(
         manifest=output / ".startergen" / "manifest.json",
         files=artifact_files,
         transformed_files=tuple(sorted(transformed_files)),
+        targets=tuple(resolved_targets),
     )
 
 

@@ -23,4 +23,5 @@ documentation:
 publication:
   starter_repository: example/minimal-lab-starter
   branch: main
+  release_id: v1
   docs_base_url: https://example.com/minimal-lab/

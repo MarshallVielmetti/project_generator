@@ -38,3 +38,21 @@ recorded in `build/starter/.startergen/manifest.json`.
 
 Design decisions for issue #3 are recorded in
 [`IMPLEMENATION/ISSUE_3_DESIGN.md`](IMPLEMENATION/ISSUE_3_DESIGN.md).
+
+## Generate teaching documentation
+
+Generate the student README, final-source exercise index, and MkDocs-compatible
+site outputs after the starter artifact is built:
+
+```bash
+uv run --project tools/startergen startergen docs --root .
+```
+
+The command validates exercise directives, local links, anchors, and assets
+offline. Use `--check-external-links` only when public HTTP(S) link checks are
+intended. The generated source index records inclusive line ranges from the
+serialized transformed files, and published exercise links use the configured
+release identifier rather than a moving branch name.
+
+Design decisions for issue #4 are recorded in
+[`IMPLEMENATION/ISSUE_4_DESIGN.md`](IMPLEMENATION/ISSUE_4_DESIGN.md).
