@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "startergen"
+version = "0.1.0"
+description = "Generate validated teaching starter projects from canonical implementations"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "pydantic>=2.8,<3",
+    "PyYAML>=6.0,<7",
+]
+
+[project.scripts]
+startergen = "startergen.cli:main"
+
+[dependency-groups]
+test = [
+    "pytest>=8.3,<9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/startergen"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra"]
+norecursedirs = ["fixtures"]

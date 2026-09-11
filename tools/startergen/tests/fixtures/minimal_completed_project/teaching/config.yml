@@ -1,0 +1,26 @@
+schema_version: 1
+project:
+  name: Minimal Lab Project
+  import_package: lab_project
+starter:
+  output: build/starter
+  include:
+    - src/lab_project
+    - tests/public
+    - tests/smoke
+    - examples
+    - pyproject.toml
+    - uv.lock
+    - LICENSE
+  exclude: []
+documentation:
+  source: teaching/project.md
+  assets: teaching/assets
+  background: teaching/background
+  readme_template: teaching/templates/README.md.j2
+  generated_source: build/docs-src
+  site_output: build/site
+publication:
+  starter_repository: example/minimal-lab-starter
+  branch: main
+  docs_base_url: https://example.com/minimal-lab/
