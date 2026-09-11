@@ -61,6 +61,7 @@ class DocumentationConfig(StrictModel):
 class PublicationConfig(StrictModel):
     starter_repository: str = Field(min_length=3)
     branch: str = Field(default="main", min_length=1)
+    release_id: str = Field(default="v1", min_length=1)
     docs_base_url: str
 
     @field_validator("starter_repository")
@@ -77,6 +78,13 @@ class PublicationConfig(StrictModel):
             HttpUrl(value)
         except Exception as exc:
             raise ValueError("must be an absolute HTTP(S) URL") from exc
+        return value
+
+    @field_validator("release_id")
+    @classmethod
+    def release_id_is_stable(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+            raise ValueError("must be a URL-safe release identifier")
         return value
 
 

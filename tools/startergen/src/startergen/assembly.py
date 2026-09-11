@@ -10,6 +10,7 @@ import stat
 import tempfile
 import uuid
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -21,7 +22,12 @@ from startergen import __version__
 from startergen.diagnostics import Diagnostic
 from startergen.paths import is_safe_relative_path, project_path
 from startergen.schema import ExerciseMetadata, ProjectMetadata
-from startergen.transform import TransformError, TransformTarget, transform_sources
+from startergen.transform import (
+    ResolvedTarget,
+    TransformError,
+    TransformTarget,
+    transform_sources,
+)
 from startergen.validate import validate_project
 from startergen.yaml_io import YamlInputError, load_yaml_bytes
 
@@ -108,6 +114,7 @@ class BuildResult:
     manifest: Path
     files: tuple[ArtifactFile, ...]
     transformed_files: tuple[str, ...]
+    targets: tuple[ResolvedTarget, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +122,20 @@ class BuildResult:
             "manifest": self.manifest.as_posix(),
             "files": [file.to_dict() for file in self.files],
             "transformed_files": list(self.transformed_files),
+            "targets": [
+                {
+                    "exercise_id": target.target.exercise_id,
+                    "symbol": target.target.symbol,
+                    "qualified_name": target.qualified_name,
+                    "source_range": {
+                        "start_line": target.source_range.start_line,
+                        "start_column": target.source_range.start_column,
+                        "end_line": target.source_range.end_line,
+                        "end_column": target.source_range.end_column,
+                    },
+                }
+                for target in self.targets
+            ],
         }
 
 
@@ -450,6 +471,18 @@ class _BuildLock:
         self.handle.close()
 
 
+@contextmanager
+def project_build_lock(root: Path) -> Iterator[None]:
+    """Hold the lock shared by starter and documentation builds."""
+
+    root = root.expanduser().resolve()
+    build_root = root / "build"
+    _assert_safe_existing_path(root, build_root)
+    build_root.mkdir(mode=0o755, parents=True, exist_ok=True)
+    with _BuildLock(build_root / ".startergen.lock"):
+        yield
+
+
 def _resolve_output(root: Path, value: str) -> tuple[Path, Path]:
     output = project_path(root, value)
     build_root = root / "build"
@@ -625,10 +658,32 @@ def build_project(
         ) from exc
 
 
+def build_project_locked(
+    root: Path,
+    *,
+    generator_version: str = __version__,
+) -> BuildResult:
+    """Build a starter while the caller owns :func:`project_build_lock`."""
+
+    try:
+        return _build_project(
+            root, generator_version=generator_version, lock_held=True
+        )
+    except AssemblyError:
+        raise
+    except OSError as exc:
+        raise AssemblyError(
+            "filesystem_error",
+            "starter assembly could not access the filesystem",
+            cause=exc,
+        ) from exc
+
+
 def _build_project(
     root: Path,
     *,
     generator_version: str,
+    lock_held: bool = False,
 ) -> BuildResult:
 
     root = root.expanduser().resolve()
@@ -642,7 +697,9 @@ def _build_project(
     config, exercises, contract_provenance = _load_contracts(root)
     build_root, output = _resolve_output(root, config.starter.output)
     transformed_files: list[str] = []
-    with _BuildLock(build_root / ".startergen.lock"):
+    resolved_targets: list[ResolvedTarget] = []
+    lock = nullcontext() if lock_held else _BuildLock(build_root / ".startergen.lock")
+    with lock:
         staging = Path(tempfile.mkdtemp(prefix=".startergen-stage-", dir=build_root))
         try:
             files = enumerate_allowlist(
@@ -681,6 +738,8 @@ def _build_project(
                     for path, result in transformed.items()
                     if result.changed
                 )
+                for result in transformed.values():
+                    resolved_targets.extend(result.targets)
             _restore_modes(staging, snapshots)
             _manifest_path, artifact_files = _write_manifest(
                 staging,
@@ -705,6 +764,7 @@ def _build_project(
         manifest=output / ".startergen" / "manifest.json",
         files=artifact_files,
         transformed_files=tuple(sorted(transformed_files)),
+        targets=tuple(resolved_targets),
     )
 
 

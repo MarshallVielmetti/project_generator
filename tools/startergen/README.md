@@ -42,3 +42,23 @@ The assembly API is available from `startergen.assembly` as
 `build_project(root)` and `enumerate_allowlist(root, include, exclude)`. The
 design boundary for this milestone is documented in
 [`IMPLEMENATION/ISSUE_3_DESIGN.md`](../../IMPLEMENATION/ISSUE_3_DESIGN.md).
+
+## Generate documentation
+
+Generate the student README and site outputs with:
+
+```bash
+uv run --project tools/startergen startergen docs --root .
+```
+
+Teaching Markdown supports headings, links, images, fenced code, inline or
+display math, `!!! note`/`!!! warning` admonitions, and standalone
+`{{ exercise("id") }}` directives. Directives are ignored inside fenced code,
+inline code, and math. README links point into the generated starter tree;
+site links use line-anchored generated source HTML below
+`publication.release_id` and the configured documentation base URL. Local
+references are checked offline; public links are checked only when
+`--check-external-links` is supplied.
+
+The issue #4 design record is in
+[`IMPLEMENATION/ISSUE_4_DESIGN.md`](../../IMPLEMENATION/ISSUE_4_DESIGN.md).
