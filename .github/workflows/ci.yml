@@ -1,0 +1,89 @@
+name: Startergen CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  generator:
+    name: Generator tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --project tools/startergen --locked --group test
+      - run: uv run --project tools/startergen pytest -q
+
+  canonical:
+    name: Canonical suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --project tools/startergen --locked --group test
+      - run: uv run --project tools/startergen startergen validate --root tools/startergen/tests/fixtures/mvp_canonical_project
+      - run: uv run --project ${{ github.workspace }}/tools/startergen pytest -q tests/private tests/public tests/smoke
+        working-directory: tools/startergen/tests/fixtures/mvp_canonical_project
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools/startergen/tests/fixtures/mvp_canonical_project/src
+
+  integrated-check:
+    name: Integrated MVP check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --project tools/startergen --locked --group test
+      - run: uv run --project tools/startergen startergen check --root tools/startergen/tests/fixtures/mvp_canonical_project --json
+
+  starter-smoke:
+    name: Generated starter smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --project tools/startergen --locked --group test
+      - run: uv run --project ${{ github.workspace }}/tools/startergen startergen build --root .
+        working-directory: tools/startergen/tests/fixtures/mvp_canonical_project
+      - run: uv run --project ${{ github.workspace }}/tools/startergen pytest -q tests/smoke
+        working-directory: tools/startergen/tests/fixtures/mvp_canonical_project/build/starter
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools/startergen/tests/fixtures/mvp_canonical_project/build/starter/src
+
+  exercise-completion:
+    name: Exercise completion (expected failure)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --project tools/startergen --locked --group test
+      - run: uv run --project ${{ github.workspace }}/tools/startergen startergen build --root .
+        working-directory: tools/startergen/tests/fixtures/mvp_canonical_project
+      - name: Run incomplete public exercises
+        id: incomplete
+        continue-on-error: true
+        run: uv run --project ${{ github.workspace }}/tools/startergen pytest -q tests/public
+        working-directory: tools/startergen/tests/fixtures/mvp_canonical_project/build/starter
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools/startergen/tests/fixtures/mvp_canonical_project/build/starter/src
+      - name: Require the starter to be incomplete
+        if: steps.incomplete.outcome == 'success'
+        run: exit 1

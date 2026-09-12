@@ -62,3 +62,20 @@ references are checked offline; public links are checked only when
 
 The issue #4 design record is in
 [`IMPLEMENATION/ISSUE_4_DESIGN.md`](../../IMPLEMENATION/ISSUE_4_DESIGN.md).
+
+## Integrated MVP validation
+
+Run the integrated check against a canonical project after the build and docs
+contracts validate:
+
+```bash
+uv run --project tools/startergen startergen check --root <canonical-root> --json
+```
+
+The check runs canonical private/public/smoke suites, installs the generated
+starter in a temporary virtual environment, verifies declared baseline failure
+reasons and dependency-ordered restoration checkpoints, runs the completed
+public suite, and compares independent starter, generated-source, and site
+outputs byte-for-byte. The representative fixture is
+`tests/fixtures/mvp_canonical_project`; its design record is in
+[`IMPLEMENATION/ISSUE_5_DESIGN.md`](../../IMPLEMENATION/ISSUE_5_DESIGN.md).

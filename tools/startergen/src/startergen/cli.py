@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from startergen.assembly import AssemblyError, build_project
+from startergen.check import CheckError, check_project
 from startergen.documentation import DocumentationError, build_documentation
 from startergen.validate import validate_project
 
@@ -46,6 +47,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     docs.add_argument(
         "--json", action="store_true", help="emit a machine-readable documentation report"
+    )
+    check = commands.add_parser(
+        "check", help="build and validate the integrated starter MVP in isolation"
+    )
+    check.add_argument(
+        "--root", required=True, type=Path, help="canonical project root"
+    )
+    check.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="per-test and per-install timeout in seconds (default: 60)",
+    )
+    check.add_argument(
+        "--json", action="store_true", help="emit a machine-readable check report"
     )
     return parser
 
@@ -125,6 +141,40 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
             print(f"Generated documentation: {result.site}")
+        return 0
+    if args.command == "check":
+        try:
+            result = check_project(args.root, timeout=args.timeout)
+        except (CheckError, DocumentationError, AssemblyError) as exc:
+            details = (
+                exc.details
+                if isinstance(exc, CheckError)
+                else {
+                    "diagnostics": [
+                        diagnostic.to_dict() for diagnostic in exc.diagnostics
+                    ]
+                }
+            )
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "checked": False,
+                            "code": exc.code,
+                            "message": str(exc),
+                            "details": details,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"integrated check failed: {exc.code}: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(f"Integrated MVP checks passed: {result.project}")
         return 0
     return 2  # pragma: no cover - protected by argparse's required subcommand
 

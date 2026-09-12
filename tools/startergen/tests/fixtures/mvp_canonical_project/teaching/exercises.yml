@@ -1,0 +1,52 @@
+schema_version: 1
+exercises:
+  - id: mean-function
+    title: Mean function
+    source:
+      file: src/mvp_project/statistics.py
+      symbol: mean
+    requires: []
+    starter:
+      strategy: replace_body
+      docstring: preserve
+      body: null
+    tests:
+      public:
+        - tests/public/test_statistics.py::test_mean
+      baseline:
+        - nodeid: tests/public/test_statistics.py::test_mean
+          expected: stub_error
+  - id: integrator-step
+    title: Integrator step
+    source:
+      file: src/mvp_project/simulation.py
+      symbol: Integrator.step
+    requires: []
+    starter:
+      strategy: replace_body
+      docstring: preserve
+      body: null
+    tests:
+      public:
+        - tests/public/test_simulation.py::test_integrator_step
+      baseline:
+        - nodeid: tests/public/test_simulation.py::test_integrator_step
+          expected: stub_error
+  - id: rollout
+    title: Dependent rollout
+    source:
+      file: src/mvp_project/simulation.py
+      symbol: rollout
+    requires:
+      - integrator-step
+    starter:
+      strategy: replace_body
+      docstring: preserve
+      body: return initial
+    tests:
+      public:
+        - tests/public/test_simulation.py::test_rollout
+      baseline:
+        - nodeid: tests/public/test_simulation.py::test_rollout
+          expected: assertion_failure
+          assertion_message: rollout must apply every integration step

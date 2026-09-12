@@ -56,3 +56,19 @@ release identifier rather than a moving branch name.
 
 Design decisions for issue #4 are recorded in
 [`IMPLEMENATION/ISSUE_4_DESIGN.md`](IMPLEMENATION/ISSUE_4_DESIGN.md).
+
+## Run the integrated MVP check
+
+Milestone 5 runs canonical private/public/smoke suites, builds the starter and
+documentation outputs, installs the generated package in a temporary isolated
+environment, checks exact exercise baseline outcomes and dependency-ordered
+restoration checkpoints, and compares two independent builds:
+
+```bash
+uv run --project tools/startergen startergen check \
+  --root tools/startergen/tests/fixtures/mvp_canonical_project --json
+```
+
+The representative three-exercise canonical project and its design decisions
+are documented in
+[`IMPLEMENATION/ISSUE_5_DESIGN.md`](IMPLEMENATION/ISSUE_5_DESIGN.md).
