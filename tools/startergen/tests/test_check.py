@@ -5,7 +5,19 @@ import shutil
 from pathlib import Path
 
 import pytest
+import startergen.check as check_module
+from startergen.assembly import AssemblyError
+from startergen.check import (
+    CheckError,
+    _load_contracts,
+    _output_snapshot,
+    _public_contracts,
+    _run_case,
+    _Runtime,
+    _verify_reproducibility,
+)
 from startergen.cli import main
+from startergen.documentation import DocumentationError
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mvp_canonical_project"
 
@@ -38,3 +50,98 @@ def test_check_cli_validates_mvp_end_to_end(
     assert report["starter"]["installed"] is True
     assert report["starter"]["completed_public"] == "passed"
     assert report["reproducible"] is True
+
+
+def test_case_does_not_reuse_a_stale_junit_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    (project / "src").mkdir(parents=True)
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    nodeid = "tests/public/test_example.py::test_example"
+    report_path = report_dir / (
+        check_module.hashlib.sha256(nodeid.encode()).hexdigest() + ".xml"
+    )
+    report_path.write_text("stale", encoding="utf-8")
+
+    def fail_before_writing_report(*args: object, **kwargs: object) -> None:
+        assert not report_path.exists()
+        raise CheckError("test_runner_failed", "simulated pytest crash")
+
+    monkeypatch.setattr(check_module, "_run_command", fail_before_writing_report)
+    with pytest.raises(CheckError) as error:
+        _run_case(
+            _Runtime(tmp_path / "runtime", Path("python")),
+            project,
+            nodeid,
+            timeout=1,
+            report_dir=report_dir,
+        )
+
+    assert error.value.code == "test_report_missing"
+
+
+def test_reproducibility_uses_configured_output_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "input.txt").write_text("input", encoding="utf-8")
+    output_paths = ("build/student", "build/generated", "build/web")
+
+    def build_custom_outputs(project: Path, **kwargs: object) -> None:
+        for relative in output_paths:
+            output = project / relative
+            output.mkdir(parents=True)
+            (output / "marker.txt").write_text("same", encoding="utf-8")
+
+    monkeypatch.setattr(check_module, "build_documentation", build_custom_outputs)
+
+    assert _verify_reproducibility(
+        root, workspace=tmp_path / "workspace", output_paths=output_paths
+    )
+    assert _output_snapshot(
+        tmp_path / "workspace" / "repro-a", output_paths
+    ) == _output_snapshot(tmp_path / "workspace" / "repro-b", output_paths)
+
+
+@pytest.mark.parametrize("error_type", [AssemblyError, DocumentationError])
+def test_check_cli_serializes_stage_failures(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[AssemblyError | DocumentationError],
+) -> None:
+    error = error_type("stage_failed", "simulated stage failure")
+
+    def fail_check(*args: object, **kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr("startergen.cli.check_project", fail_check)
+
+    assert main(["check", "--root", str(tmp_path), "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report == {
+        "checked": False,
+        "code": "stage_failed",
+        "message": "simulated stage failure",
+        "details": {"diagnostics": []},
+    }
+
+
+def test_duplicate_baselines_are_rejected_before_lookup() -> None:
+    _config, metadata = _load_contracts(FIXTURE)
+    first = metadata.exercises[0]
+    duplicate = first.model_copy(
+        update={
+            "tests": first.tests.model_copy(
+                update={"baseline": first.tests.baseline * 2}
+            )
+        }
+    )
+
+    with pytest.raises(CheckError) as error:
+        _public_contracts((duplicate, *metadata.exercises[1:]))
+
+    assert error.value.code == "duplicate_baseline_test"

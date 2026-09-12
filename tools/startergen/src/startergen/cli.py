@@ -145,7 +145,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "check":
         try:
             result = check_project(args.root, timeout=args.timeout)
-        except CheckError as exc:
+        except (CheckError, DocumentationError, AssemblyError) as exc:
+            details = (
+                exc.details
+                if isinstance(exc, CheckError)
+                else {
+                    "diagnostics": [
+                        diagnostic.to_dict() for diagnostic in exc.diagnostics
+                    ]
+                }
+            )
             if args.json:
                 print(
                     json.dumps(
@@ -153,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
                             "checked": False,
                             "code": exc.code,
                             "message": str(exc),
-                            "details": exc.details,
+                            "details": details,
                         },
                         indent=2,
                         sort_keys=True,

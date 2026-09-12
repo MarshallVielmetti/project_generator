@@ -205,6 +205,17 @@ def _pytest_command(
     ]
 
 
+def _clear_report(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise CheckError(
+            "test_report_cleanup_failed",
+            f"could not clear the previous JUnit report: {path}",
+            cause=exc,
+        ) from exc
+
+
 def _run_case(
     runtime: _Runtime,
     project: Path,
@@ -214,6 +225,7 @@ def _run_case(
     report_dir: Path,
 ) -> _CaseResult:
     report_path = report_dir / f"{hashlib.sha256(nodeid.encode()).hexdigest()}.xml"
+    _clear_report(report_path)
     command = _pytest_command(runtime.python, [nodeid], report_path)
     environment = _clean_environment(
         pythonpath=project / "src", virtualenv=runtime.root / "venv"
@@ -260,6 +272,7 @@ def _run_suite(
     if not nodes:
         raise CheckError("tests_missing", "no tests were declared for the requested suite")
     report_path = report_dir / f"suite-{hashlib.sha256('|'.join(nodes).encode()).hexdigest()}.xml"
+    _clear_report(report_path)
     command = _pytest_command(python, nodes, report_path)
     environment = _clean_environment(pythonpath=pythonpath, virtualenv=virtualenv)
     result = _run_command(
@@ -428,6 +441,19 @@ def _assert_baseline(case: _CaseResult, baseline: BaselineTest, *, exercise_id: 
 def _public_contracts(exercises: tuple[Exercise, ...]) -> dict[str, tuple[Exercise, BaselineTest]]:
     contracts: dict[str, tuple[Exercise, BaselineTest]] = {}
     for exercise in exercises:
+        seen_baselines: set[str] = set()
+        duplicate_baselines: list[str] = []
+        for baseline in exercise.tests.baseline:
+            if baseline.nodeid in seen_baselines and baseline.nodeid not in duplicate_baselines:
+                duplicate_baselines.append(baseline.nodeid)
+            seen_baselines.add(baseline.nodeid)
+        if duplicate_baselines:
+            raise CheckError(
+                "duplicate_baseline_test",
+                f"exercise {exercise.id} declares duplicate baseline test(s): "
+                + ", ".join(duplicate_baselines),
+                details={"exercise_id": exercise.id, "nodeids": duplicate_baselines},
+            )
         baselines = {baseline.nodeid: baseline for baseline in exercise.tests.baseline}
         if set(exercise.tests.public) != set(baselines):
             raise CheckError(
@@ -452,9 +478,9 @@ def _copy_for_build(root: Path, destination: Path) -> None:
     shutil.copytree(root, destination, ignore=ignored)
 
 
-def _output_snapshot(root: Path) -> dict[str, bytes]:
+def _output_snapshot(root: Path, output_paths: tuple[str, ...]) -> dict[str, bytes]:
     snapshot: dict[str, bytes] = {}
-    for relative_root in ("build/starter", "build/docs-src", "build/site"):
+    for relative_root in output_paths:
         output = root / relative_root
         if not output.is_dir():
             raise CheckError("output_missing", f"expected integrated output directory is missing: {relative_root}")
@@ -464,15 +490,17 @@ def _output_snapshot(root: Path) -> dict[str, bytes]:
     return snapshot
 
 
-def _verify_reproducibility(root: Path, *, workspace: Path) -> bool:
+def _verify_reproducibility(
+    root: Path, *, workspace: Path, output_paths: tuple[str, ...]
+) -> bool:
     first = workspace / "repro-a"
     second = workspace / "repro-b"
     _copy_for_build(root, first)
     _copy_for_build(root, second)
     build_documentation(first)
     build_documentation(second)
-    first_snapshot = _output_snapshot(first)
-    second_snapshot = _output_snapshot(second)
+    first_snapshot = _output_snapshot(first, output_paths)
+    second_snapshot = _output_snapshot(second, output_paths)
     if first_snapshot != second_snapshot:
         differing = sorted(
             key
@@ -595,7 +623,15 @@ def check_project(root: Path, *, timeout: float = 60.0) -> CheckReport:
             virtualenv=runtime.root / "venv",
             pythonpath=completed / "src",
         )
-        reproducible = _verify_reproducibility(root, workspace=workspace / "repro")
+        reproducible = _verify_reproducibility(
+            root,
+            workspace=workspace / "repro",
+            output_paths=(
+                config.starter.output,
+                config.documentation.generated_source,
+                config.documentation.site_output,
+            ),
+        )
     return CheckReport(
         project=root,
         artifact=artifact,
