@@ -79,3 +79,30 @@ public suite, and compares independent starter, generated-source, and site
 outputs byte-for-byte. The representative fixture is
 `tests/fixtures/mvp_canonical_project`; its design record is in
 [`IMPLEMENATION/ISSUE_5_DESIGN.md`](../../IMPLEMENATION/ISSUE_5_DESIGN.md).
+
+## Publish an immutable release
+
+Create a reviewable plan with no deployment-side effects:
+
+```bash
+uv run --project tools/startergen startergen release \
+  --root <canonical-root> --dry-run --json
+```
+
+Publish only from a clean canonical commit by providing a clean checkout of
+the configured starter repository and a documentation deployment directory:
+
+```bash
+uv run --project tools/startergen startergen release \
+  --root <canonical-root> \
+  --starter-worktree <starter-checkout> \
+  --docs-root <versioned-docs-root> --json
+```
+
+The starter stage commits and pushes the validated artifact, creates an
+immutable release tag, and verifies both remote refs. The documentation stage
+atomically updates `releases/<release_id>` and `latest`; both stages persist
+independent retry status in `build/release/<release_id>/transaction.json`.
+
+The issue #6 design record is in
+[`IMPLEMENATION/ISSUE_6_DESIGN.md`](../../IMPLEMENATION/ISSUE_6_DESIGN.md).

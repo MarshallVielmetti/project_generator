@@ -10,6 +10,7 @@ from pathlib import Path
 from startergen.assembly import AssemblyError, build_project
 from startergen.check import CheckError, check_project
 from startergen.documentation import DocumentationError, build_documentation
+from startergen.publication import PublicationError, release_project
 from startergen.validate import validate_project
 
 
@@ -62,6 +63,41 @@ def _parser() -> argparse.ArgumentParser:
     )
     check.add_argument(
         "--json", action="store_true", help="emit a machine-readable check report"
+    )
+    release = commands.add_parser(
+        "release", help="validate, plan, and publish an immutable starter release"
+    )
+    release.add_argument(
+        "--root", required=True, type=Path, help="canonical project root"
+    )
+    release.add_argument(
+        "--starter-worktree",
+        type=Path,
+        help="clean checkout of the configured starter repository",
+    )
+    release.add_argument(
+        "--docs-root",
+        type=Path,
+        help="versioned documentation deployment directory",
+    )
+    release.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="write a release plan and transaction state without changing targets",
+    )
+    release.add_argument(
+        "--mark-template",
+        action="store_true",
+        help="mark the configured starter repository as a GitHub template",
+    )
+    release.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="per-test and per-install timeout in seconds (default: 60)",
+    )
+    release.add_argument(
+        "--json", action="store_true", help="emit a machine-readable release report"
     )
     return parser
 
@@ -175,6 +211,52 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
             print(f"Integrated MVP checks passed: {result.project}")
+        return 0
+    if args.command == "release":
+        try:
+            result = release_project(
+                args.root,
+                starter_worktree=args.starter_worktree,
+                docs_root=args.docs_root,
+                dry_run=args.dry_run,
+                mark_template=args.mark_template,
+                timeout=args.timeout,
+            )
+        except (PublicationError, CheckError, DocumentationError, AssemblyError) as exc:
+            details = (
+                exc.details
+                if isinstance(exc, (PublicationError, CheckError))
+                else {
+                    "diagnostics": [
+                        diagnostic.to_dict() for diagnostic in exc.diagnostics
+                    ]
+                }
+            )
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "released": False,
+                            "code": getattr(exc, "code", "release_failed"),
+                            "message": str(exc),
+                            "details": details,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(
+                    f"release failed: {getattr(exc, 'code', 'release_failed')}: {exc}",
+                    file=sys.stderr,
+                )
+            return 1
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        elif result.dry_run:
+            print(f"Release plan written: {result.transaction}")
+        else:
+            print(f"Release published: {result.plan.release_id}")
         return 0
     return 2  # pragma: no cover - protected by argparse's required subcommand
 
