@@ -42,11 +42,17 @@ The publisher skips a commit when the target already contains the same validated
 
 An existing release identifier with a different artifact is rejected, and a release whose natural version ordering is older than the current published release is rejected as stale.
 
-The stale check is performed against the target's release metadata after fetching the target branch, while a non-fast-forward push protects against a concurrent release that wins the race after the check.
+The stale check is performed against the target's release metadata after fetching the target branch, while a non-fast-forward push protects against a concurrent release that wins the race after the check. A local tag left behind by a failed tag push is reused only after its commit is verified, so retrying the same release is safe.
 
-Documentation uses an atomic temporary directory and promotes `releases/<release_id>` before atomically replacing `latest`.
+Documentation uses an exclusive filesystem lock around its stale checks and both promotions. It uses an atomic temporary directory and promotes `releases/<release_id>` before atomically replacing `latest`, so concurrent publishers cannot roll `latest` backward after an older check.
 
 The `latest` directory is not updated until the versioned release tree has been completely copied and its release metadata has been written.
+
+Versioned release directories are immutable: an occupied directory without trusted
+release metadata is rejected, while an existing directory with matching metadata
+is reused. The destination root, `releases` parent, `latest`, and all ancestors
+are checked for symlinks and special files before any directory is created or
+renamed.
 
 ## Dedicated repository and credential boundary
 
@@ -54,13 +60,20 @@ Only the configured starter artifact is copied into the dedicated starter reposi
 
 The optional `--mark-template` operation invokes `gh repo edit` only after starter and documentation publication succeed.
 
-The manual release workflow supplies `STARTER_REPO_TOKEN` only to the target checkout, publication command, and optional template operation.
+Validation subprocesses remove GitHub and starter-repository credentials from
+their environment. The manual workflow retains the checkout action's credential
+for Git pushes, but supplies `STARTER_REPO_TOKEN` only to the separate optional
+template step after validation and publication.
 
-The workflow reads `STARTER_REPOSITORY` and `STARTER_BRANCH` from repository variables, so those deployment settings can be kept aligned with the canonical publication contract without putting environment paths in authoring YAML.
+The workflow reads `STARTER_REPOSITORY` and `STARTER_BRANCH` from repository
+variables and passes the branch as an explicit expectation to the CLI; release
+planning fails if it differs from `publication.branch`.
 
 Pull-request and push validation workflows retain `contents: read` and do not receive publication credentials.
 
-The workflow uploads the versioned documentation tree as a GitHub Pages artifact and then deploys it through the Pages deployment action.
+The workflow serializes releases per starter repository, uploads the versioned
+documentation tree as a GitHub Pages artifact, and deploys it through a separate
+job using the protected `github-pages` environment.
 
 ## Deliberate non-goals
 

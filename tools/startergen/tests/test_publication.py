@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
+import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 from startergen import publication
@@ -124,6 +128,30 @@ def test_dry_run_writes_reviewable_plan_and_transaction(
     assert not (tmp_path / "starter").exists()
 
 
+def test_release_plan_rejects_branch_configuration_drift(tmp_path: Path) -> None:
+    project = _copy_fixture(tmp_path)
+    plan = _checked_plan(project)
+
+    with pytest.raises(PublicationError) as error:
+        build_release_plan(
+            project,
+            check=CheckReport(
+                project=project,
+                artifact=plan.starter_artifact,
+                dependency_order=(),
+                canonical_tests=(),
+                baseline={},
+                checkpoints=(),
+                completed_public="passed",
+                reproducible=True,
+                installed=True,
+            ),
+            expected_starter_branch="release",
+        )
+
+    assert error.value.code == "publication_branch_mismatch"
+
+
 def test_release_project_records_independent_completed_stages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -184,6 +212,57 @@ def test_starter_publication_is_tagged_verified_and_redundant_safe(
     assert not (worktree / "tests/private").exists()
 
 
+def test_starter_tag_push_retry_reuses_local_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _copy_fixture(tmp_path)
+    plan = _checked_plan(project)
+    worktree = _starter_worktree(tmp_path)
+    real_git = publication._git
+    failed = False
+
+    def fail_first_tag_push(
+        arguments: list[str], *, cwd: Path, allow_failure: bool = False
+    ):
+        nonlocal failed
+        if arguments == ["push", "origin", "refs/tags/v1"] and not failed:
+            failed = True
+            raise PublicationError("git_command_failed", "simulated tag push failure")
+        return real_git(arguments, cwd=cwd, allow_failure=allow_failure)
+
+    monkeypatch.setattr(publication, "_git", fail_first_tag_push)
+    with pytest.raises(PublicationError) as error:
+        publish_starter(plan, worktree)
+
+    assert error.value.code == "git_command_failed"
+    assert publication._local_ref(worktree, "refs/tags/v1") is not None
+    retry = publish_starter(plan, worktree)
+
+    assert failed is True
+    assert retry.status == "skipped"
+    assert retry.verified is True
+
+
+def test_non_github_starter_remote_is_rejected(
+    tmp_path: Path,
+) -> None:
+    project = _copy_fixture(tmp_path)
+    plan = _checked_plan(project)
+    worktree = _starter_worktree(tmp_path)
+    _git(
+        worktree,
+        "remote",
+        "set-url",
+        "origin",
+        "https://gitlab.com/example/mvp-starter.git",
+    )
+
+    with pytest.raises(PublicationError) as error:
+        publish_starter(plan, worktree)
+
+    assert error.value.code == "starter_remote_mismatch"
+
+
 def test_documentation_update_is_atomic_and_latest_is_versioned(tmp_path: Path) -> None:
     project = _copy_fixture(tmp_path)
     plan = _checked_plan(project)
@@ -200,6 +279,51 @@ def test_documentation_update_is_atomic_and_latest_is_versioned(tmp_path: Path) 
     )
     assert latest["release_id"] == "v1"
     assert latest["documentation_id"] == plan.documentation_id
+    base_path = urlparse(plan.docs_base_url).path.rstrip("/") + "/"
+    published_markdown = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (docs_root / "releases" / plan.release_id).rglob("*.md")
+    )
+    published_links = re.findall(r"https://[^\s)]+", published_markdown)
+    assert published_links
+    for link in published_links:
+        parsed = urlparse(link)
+        assert parsed.path.startswith(base_path)
+        relative = parsed.path.removeprefix(base_path)
+        assert (docs_root / relative).is_file(), link
+
+
+def test_occupied_release_directory_without_metadata_is_immutable(
+    tmp_path: Path,
+) -> None:
+    project = _copy_fixture(tmp_path)
+    plan = _checked_plan(project)
+    docs_root = tmp_path / "docs"
+    occupied = docs_root / "releases" / plan.release_id
+    occupied.mkdir(parents=True)
+    (occupied / "index.html").write_text("manual content\n", encoding="utf-8")
+
+    with pytest.raises(PublicationError) as error:
+        deploy_documentation(plan, docs_root)
+
+    assert error.value.code == "immutable_release_conflict"
+    assert (occupied / "index.html").read_text(encoding="utf-8") == "manual content\n"
+
+
+def test_symlinked_releases_parent_is_rejected(tmp_path: Path) -> None:
+    project = _copy_fixture(tmp_path)
+    plan = _checked_plan(project)
+    docs_root = tmp_path / "docs"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    docs_root.mkdir()
+    (docs_root / "releases").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(PublicationError) as error:
+        deploy_documentation(plan, docs_root)
+
+    assert error.value.code == "unsafe_target"
+    assert not (outside / plan.release_id).exists()
 
 
 def test_older_release_cannot_replace_newer_documentation(tmp_path: Path) -> None:
@@ -219,6 +343,76 @@ def test_older_release_cannot_replace_newer_documentation(tmp_path: Path) -> Non
         )
     )
     assert latest["release_id"] == "v2"
+
+
+def test_concurrent_documentation_promotions_are_serialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _copy_fixture(tmp_path)
+    plan = _checked_plan(project)
+    docs_root = tmp_path / "docs"
+    older = replace(plan, release_id="v2")
+    newer = replace(plan, release_id="v3")
+    staging_started = threading.Event()
+    allow_older = threading.Event()
+    newer_waiting_for_lock = threading.Event()
+    newer_finished = threading.Event()
+    original_copytree = publication.shutil.copytree
+    paused = False
+    outcomes: dict[str, object] = {}
+
+    def pause_older_staging(
+        source: str | Path, destination: str | Path, *args: object, **kwargs: object
+    ):
+        nonlocal paused
+        if not paused and Path(source) == older.site_artifact:
+            paused = True
+            staging_started.set()
+            assert allow_older.wait(timeout=5)
+        return original_copytree(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(publication.shutil, "copytree", pause_older_staging)
+    original_lock = publication._documentation_lock
+
+    @contextmanager
+    def observe_newer_lock(root: Path):
+        if threading.current_thread().name == "v3":
+            newer_waiting_for_lock.set()
+        with original_lock(root):
+            yield
+
+    monkeypatch.setattr(publication, "_documentation_lock", observe_newer_lock)
+
+    def run_release(name: str, release_plan) -> None:
+        try:
+            outcomes[name] = deploy_documentation(release_plan, docs_root)
+        except PublicationError as exc:  # pragma: no cover - reported below
+            outcomes[name] = exc
+        finally:
+            if name == "v3":
+                newer_finished.set()
+
+    older_thread = threading.Thread(target=run_release, args=("v2", older), name="v2")
+    newer_thread = threading.Thread(target=run_release, args=("v3", newer), name="v3")
+    older_thread.start()
+    assert staging_started.wait(timeout=5)
+    newer_thread.start()
+    assert newer_waiting_for_lock.wait(timeout=5)
+    assert not newer_finished.is_set()
+    allow_older.set()
+    older_thread.join(timeout=10)
+    newer_thread.join(timeout=10)
+
+    assert not older_thread.is_alive()
+    assert not newer_thread.is_alive()
+    assert isinstance(outcomes["v2"], publication.StageResult)
+    assert isinstance(outcomes["v3"], publication.StageResult)
+    latest = json.loads(
+        (docs_root / "latest" / ".startergen" / "release.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert latest["release_id"] == "v3"
 
 
 def test_failed_documentation_stage_preserves_previous_latest(

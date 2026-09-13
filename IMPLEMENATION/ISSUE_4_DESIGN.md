@@ -14,8 +14,9 @@ on top of the validated starter artifact from issue #3.
   and `!!! tip` forms become blockquotes that GitHub can display.
 - `startergen.documentation.render_site` emits a MkDocs-compatible Markdown
   page and a deterministic static HTML preview. Site exercise links use the
-  immutable `publication.release_id` below `publication.docs_base_url`, so a
-  branch rename cannot silently move a released link. The preview uses a
+  immutable `publication.release_id` below
+  `publication.docs_base_url/releases/`, so a branch rename cannot silently
+  move a released link. The preview uses a
   pinned MathJax 3.2.2 URL and retains the same TeX delimiters for inline and
   display math.
 

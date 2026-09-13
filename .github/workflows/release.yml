@@ -15,15 +15,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: starter-release-${{ vars.STARTER_REPOSITORY || github.repository }}
+  cancel-in-progress: false
+
 jobs:
-  release:
+  publish:
     name: Validate and publish immutable release
     runs-on: ubuntu-latest
     environment: starter-release
     permissions:
       contents: read
-      pages: write
-      id-token: write
     steps:
       - name: Check out canonical project
         uses: actions/checkout@v4
@@ -49,19 +51,37 @@ jobs:
 
       - name: Validate and publish starter and documentation artifacts
         env:
-          STARTER_REPO_TOKEN: ${{ secrets.STARTER_REPO_TOKEN }}
+          STARTER_BRANCH: ${{ vars.STARTER_BRANCH || 'main' }}
         run: >-
           uv run --project tools/startergen startergen release
           --root "${{ inputs.canonical_root }}"
           --starter-worktree .release/starter
           --docs-root "$RUNNER_TEMP/versioned-docs"
-          ${{ inputs.mark_template && '--mark-template' || '' }}
+          --expected-starter-branch "$STARTER_BRANCH"
           --json
+
+      - name: Mark starter repository as a GitHub template
+        if: ${{ inputs.mark_template == true }}
+        env:
+          GH_TOKEN: ${{ secrets.STARTER_REPO_TOKEN }}
+        run: gh repo edit "${{ vars.STARTER_REPOSITORY }}" --template
 
       - name: Upload versioned documentation
         uses: actions/upload-pages-artifact@v3
         with:
           path: ${{ runner.temp }}/versioned-docs
 
+  pages:
+    name: Deploy documentation to GitHub Pages
+    needs: publish
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
       - name: Deploy documentation to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4

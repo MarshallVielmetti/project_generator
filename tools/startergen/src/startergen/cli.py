@@ -91,6 +91,10 @@ def _parser() -> argparse.ArgumentParser:
         help="mark the configured starter repository as a GitHub template",
     )
     release.add_argument(
+        "--expected-starter-branch",
+        help="require the workflow checkout branch to match publication.branch",
+    )
+    release.add_argument(
         "--timeout",
         type=float,
         default=60.0,
@@ -221,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 mark_template=args.mark_template,
                 timeout=args.timeout,
+                expected_starter_branch=args.expected_starter_branch,
             )
         except (PublicationError, CheckError, DocumentationError, AssemblyError) as exc:
             details = (

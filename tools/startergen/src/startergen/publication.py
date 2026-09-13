@@ -10,15 +10,18 @@ republishing the first stage.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -70,7 +73,7 @@ class ReleasePlan:
 
     @property
     def documentation_url(self) -> str:
-        return f"{self.docs_base_url.rstrip('/')}/{self.release_id}/"
+        return f"{self.docs_base_url.rstrip('/')}/releases/{self.release_id}/"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -335,6 +338,7 @@ def build_release_plan(
     *,
     check: CheckReport | None = None,
     generator_version: str = __version__,
+    expected_starter_branch: str | None = None,
 ) -> ReleasePlan:
     """Create a release plan from a completed integrated check."""
 
@@ -345,6 +349,18 @@ def build_release_plan(
         raise PublicationError(
             "publication_config_missing",
             "teaching/config.yml does not define a publication section",
+        )
+    if (
+        expected_starter_branch is not None
+        and publication.branch != expected_starter_branch
+    ):
+        raise PublicationError(
+            "publication_branch_mismatch",
+            "the checked-out starter branch does not match publication.branch",
+            details={
+                "configured": publication.branch,
+                "expected": expected_starter_branch,
+            },
         )
     release_id = _ensure_release_id(publication.release_id)
     if check is None:
@@ -472,6 +488,75 @@ def _save_stage(
     _write_json(path, transaction)
 
 
+def _assert_safe_path_ancestors(path: Path, *, label: str) -> None:
+    """Reject symlinked or non-directory ancestors before any destination I/O."""
+
+    absolute = path.expanduser().absolute()
+    current = Path(absolute.anchor)
+    parts = absolute.parts[1:]
+    for index, part in enumerate(parts):
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(mode):
+            raise PublicationError(
+                "unsafe_target",
+                f"{label} contains a symlinked path component: {current}",
+            )
+        if index < len(parts) - 1 and not stat.S_ISDIR(mode):
+            raise PublicationError(
+                "unsafe_target",
+                f"{label} contains a non-directory path component: {current}",
+            )
+
+
+def _assert_safe_directory_path(path: Path, *, label: str) -> None:
+    _assert_safe_path_ancestors(path, label=label)
+    try:
+        mode = path.expanduser().absolute().lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise PublicationError(
+            "unsafe_target", f"{label} is not a real directory: {path}"
+        )
+
+
+def _assert_safe_file_path(path: Path, *, label: str) -> None:
+    _assert_safe_path_ancestors(path, label=label)
+    try:
+        mode = path.expanduser().absolute().lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise PublicationError(
+            "unsafe_target", f"{label} is not a regular file: {path}"
+        )
+
+
+@contextmanager
+def _documentation_lock(docs_root: Path) -> Iterator[None]:
+    """Serialize metadata checks and documentation promotion for one sink."""
+
+    lock_path = docs_root.parent / f".{docs_root.name}.startergen.lock"
+    _assert_safe_file_path(lock_path, label="documentation lock")
+    try:
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:
+        raise PublicationError(
+            "documentation_lock_failed",
+            f"could not lock documentation destination: {docs_root}",
+            cause=exc,
+        ) from exc
+
+
 def _read_release_metadata(root: Path) -> dict[str, Any] | None:
     if root.is_symlink() or (root / ".startergen").is_symlink():
         raise PublicationError(
@@ -563,13 +648,15 @@ def _validate_git_worktree(worktree: Path, *, plan: ReleasePlan) -> None:
 
 
 def _validate_starter_remote(worktree: Path, repository: str) -> None:
-    """Reject an obvious GitHub target mismatch, while allowing local test remotes."""
+    """Require the configured GitHub destination, while allowing local test remotes."""
 
     remote = _git_output(["remote", "get-url", "origin"], cwd=worktree)
     if not remote:
         raise PublicationError(
             "starter_remote_missing", "starter target has no origin remote"
         )
+    if remote.startswith("file:///"):
+        return
     if "://" not in remote and not remote.startswith("git@"):
         return
     normalized = remote.removesuffix(".git").rstrip("/")
@@ -585,7 +672,11 @@ def _validate_starter_remote(worktree: Path, repository: str) -> None:
         if normalized.startswith("git@github.com:"):
             normalized = normalized.removeprefix("git@github.com:")
         else:
-            return
+            raise PublicationError(
+                "starter_remote_mismatch",
+                f"starter origin {remote!r} is not a GitHub remote",
+                details={"remote": remote, "configured": repository},
+            )
     if normalized.casefold() != repository.casefold():
         raise PublicationError(
             "starter_remote_mismatch",
@@ -636,6 +727,15 @@ def _remote_ref(worktree: Path, ref: str) -> str | None:
         )
     line = next((line for line in result.stdout.splitlines() if line.strip()), None)
     return line.split("\t", 1)[0] if line is not None else None
+
+
+def _local_ref(worktree: Path, ref: str) -> str | None:
+    result = _git(
+        ["rev-parse", "--verify", f"{ref}^{{}}"], cwd=worktree, allow_failure=True
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
 
 
 def _verify_remote_release(
@@ -703,15 +803,23 @@ def publish_starter(
         status = "published"
 
     existing_tag = _remote_ref(worktree, f"refs/tags/{plan.release_id}")
+    local_tag = _local_ref(worktree, f"refs/tags/{plan.release_id}")
     if existing_tag is not None and existing_tag != commit:
         raise PublicationError(
             "immutable_tag_conflict",
             f"release tag {plan.release_id} already points to another commit",
             details={"existing": existing_tag, "expected": commit},
         )
+    if local_tag is not None and local_tag != commit:
+        raise PublicationError(
+            "immutable_tag_conflict",
+            f"local release tag {plan.release_id} already points to another commit",
+            details={"existing": local_tag, "expected": commit},
+        )
     if existing_tag is None:
         _git(["push", "origin", f"HEAD:{plan.branch}"], cwd=worktree)
-        _git(["tag", plan.release_id, commit], cwd=worktree)
+        if local_tag is None:
+            _git(["tag", plan.release_id, commit], cwd=worktree)
         _git(["push", "origin", f"refs/tags/{plan.release_id}"], cwd=worktree)
     else:
         _git(["push", "origin", f"HEAD:{plan.branch}"], cwd=worktree)
@@ -722,6 +830,8 @@ def publish_starter(
 
 
 def _atomic_replace_directory(staging: Path, destination: Path) -> None:
+    _assert_safe_directory_path(staging, label="documentation staging directory")
+    _assert_safe_directory_path(destination, label="documentation destination")
     backup = destination.with_name(f".{destination.name}.backup-{uuid.uuid4().hex}")
     had_previous = destination.exists()
     if had_previous:
@@ -750,75 +860,96 @@ def _docs_metadata(plan: ReleasePlan) -> dict[str, Any]:
 def deploy_documentation(plan: ReleasePlan, docs_root: Path) -> StageResult:
     """Atomically deploy one version and then update the ``latest`` copy."""
 
-    docs_root = docs_root.expanduser()
-    if docs_root.is_symlink():
-        raise PublicationError(
-            "unsafe_target", f"documentation destination is a symlink: {docs_root}"
-        )
-    docs_root = docs_root.resolve()
+    requested_root = docs_root.expanduser()
+    _assert_safe_path_ancestors(requested_root, label="documentation destination")
+    docs_root = requested_root.resolve()
+    _assert_safe_directory_path(docs_root, label="documentation destination")
     if docs_root == plan.project or plan.project in docs_root.parents:
         raise PublicationError(
             "canonical_destination",
             "documentation destination cannot be inside the canonical checkout",
         )
     docs_root.mkdir(mode=0o755, parents=True, exist_ok=True)
-    releases = docs_root / "releases"
-    releases.mkdir(mode=0o755, exist_ok=True)
-    release = releases / plan.release_id
-    existing = _read_release_metadata(release)
-    latest_metadata = _read_release_metadata(docs_root / "latest")
-    _assert_not_stale(plan, existing)
-    _assert_not_stale(plan, latest_metadata)
-    if (
-        existing is not None
-        and existing.get("documentation_id") == plan.documentation_id
-        and latest_metadata is not None
-        and latest_metadata.get("release_id") == plan.release_id
-    ):
+    with _documentation_lock(docs_root):
+        _assert_safe_directory_path(docs_root, label="documentation destination")
+        releases = docs_root / "releases"
+        _assert_safe_directory_path(releases, label="documentation releases directory")
+        releases.mkdir(mode=0o755, exist_ok=True)
+        release = releases / plan.release_id
+        _assert_safe_directory_path(release, label="versioned documentation directory")
+        latest_path = docs_root / "latest"
+        _assert_safe_directory_path(latest_path, label="latest documentation directory")
+        existing = _read_release_metadata(release)
+        latest_metadata = _read_release_metadata(latest_path)
+        _assert_not_stale(plan, existing)
+        _assert_not_stale(plan, latest_metadata)
+        if (
+            existing is not None
+            and existing.get("documentation_id") == plan.documentation_id
+            and latest_metadata is not None
+            and latest_metadata.get("release_id") == plan.release_id
+        ):
+            return StageResult(
+                status="skipped",
+                release_path=release.as_posix(),
+                verified=True,
+            )
+        if existing is None and release.exists() and any(release.iterdir()):
+            raise PublicationError(
+                "immutable_release_conflict",
+                f"release {plan.release_id} already exists without trusted metadata",
+            )
+        if existing is not None and (
+            existing.get("stage") != "documentation"
+            or existing.get("documentation_id") != plan.documentation_id
+        ):
+            raise PublicationError(
+                "immutable_release_conflict",
+                f"release {plan.release_id} does not contain trusted documentation metadata",
+            )
+
+        staging_root = Path(
+            tempfile.mkdtemp(prefix=f".startergen-{plan.release_id}-", dir=docs_root)
+        )
+        staging_release = staging_root / "release"
+        try:
+            if existing is None:
+                shutil.copytree(
+                    plan.site_artifact, staging_release, copy_function=shutil.copy2
+                )
+                _write_json(
+                    staging_release / RELEASE_METADATA_PATH, _docs_metadata(plan)
+                )
+                _atomic_replace_directory(staging_release, release)
+
+            staging_latest = staging_root / "latest"
+            shutil.copytree(release, staging_latest, copy_function=shutil.copy2)
+            _atomic_replace_directory(staging_latest, latest_path)
+        except PublicationError:
+            raise
+        except (OSError, shutil.Error) as exc:
+            raise PublicationError(
+                "documentation_deploy_failed",
+                "documentation deployment failed before latest was updated",
+                cause=exc,
+            ) from exc
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+        published = _read_release_metadata(release)
+        latest = _read_release_metadata(latest_path)
+        if (
+            published is None
+            or latest is None
+            or latest.get("artifact_id") != plan.artifact_id
+        ):
+            raise PublicationError(
+                "documentation_verification_failed",
+                "deployed documentation does not carry the validated release identity",
+            )
         return StageResult(
-            status="skipped",
-            release_path=release.as_posix(),
-            verified=True,
+            status="published", release_path=release.as_posix(), verified=True
         )
-
-    staging_root = Path(
-        tempfile.mkdtemp(prefix=f".startergen-{plan.release_id}-", dir=docs_root)
-    )
-    staging_release = staging_root / "release"
-    try:
-        shutil.copytree(plan.site_artifact, staging_release, copy_function=shutil.copy2)
-        _write_json(staging_release / RELEASE_METADATA_PATH, _docs_metadata(plan))
-        release.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-        _atomic_replace_directory(staging_release, release)
-
-        staging_latest = staging_root / "latest"
-        shutil.copytree(release, staging_latest, copy_function=shutil.copy2)
-        _atomic_replace_directory(staging_latest, docs_root / "latest")
-    except PublicationError:
-        raise
-    except (OSError, shutil.Error) as exc:
-        raise PublicationError(
-            "documentation_deploy_failed",
-            "documentation deployment failed before latest was updated",
-            cause=exc,
-        ) from exc
-    finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
-
-    published = _read_release_metadata(release)
-    latest = _read_release_metadata(docs_root / "latest")
-    if (
-        published is None
-        or latest is None
-        or latest.get("artifact_id") != plan.artifact_id
-    ):
-        raise PublicationError(
-            "documentation_verification_failed",
-            "deployed documentation does not carry the validated release identity",
-        )
-    return StageResult(
-        status="published", release_path=release.as_posix(), verified=True
-    )
 
 
 def _mark_template(repository: str) -> None:
@@ -858,6 +989,7 @@ def release_project(
     dry_run: bool = False,
     mark_template: bool = False,
     timeout: float = 60.0,
+    expected_starter_branch: str | None = None,
 ) -> ReleaseResult:
     """Run the integrated check and publish its immutable outputs.
 
@@ -867,7 +999,11 @@ def release_project(
 
     root = root.expanduser().resolve()
     check = check_project(root, timeout=timeout)
-    plan = build_release_plan(root, check=check)
+    plan = build_release_plan(
+        root,
+        check=check,
+        expected_starter_branch=expected_starter_branch,
+    )
     transaction_path, transaction = _load_or_create_transaction(plan)
     if dry_run:
         return ReleaseResult(

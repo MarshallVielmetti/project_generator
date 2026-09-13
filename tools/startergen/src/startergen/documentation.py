@@ -376,7 +376,7 @@ def _exercise_links(
         else:
             base = publication.docs_base_url.rstrip("/")
             site_href = (
-                f"{base}/{publication.release_id}/source/{encoded_source}.html"
+                f"{base}/releases/{publication.release_id}/source/{encoded_source}.html"
                 f"#L{start}-L{end}"
             )
         links.append(
