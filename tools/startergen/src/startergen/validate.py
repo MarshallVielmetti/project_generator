@@ -328,6 +328,17 @@ def validate_project(root: Path) -> ValidationReport:
         )
         if path is not None:
             input_paths.append((field, path))
+    for field, value in (
+        ("documentation.pages", config.documentation.pages),
+        ("documentation.site_config", config.documentation.site_config),
+    ):
+        if value is None:
+            continue
+        path = validate_input_path(
+            root, value, field=field, file=config_file, diagnostics=diagnostics
+        )
+        if path is not None:
+            input_paths.append((field, path))
 
     output_paths: list[tuple[str, Path]] = []
     for field, value in (

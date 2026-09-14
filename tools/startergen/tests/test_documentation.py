@@ -25,7 +25,6 @@ def test_documentation_build_covers_student_and_site_outputs(tmp_path: Path) -> 
 
     result = build_documentation(project)
     readme = result.readme.read_text(encoding="utf-8")
-    site_markdown = (result.site / "index.md").read_text(encoding="utf-8")
     site_html = (result.site / "index.html").read_text(encoding="utf-8")
     index = json.loads((result.generated_source / "exercises.json").read_text(encoding="utf-8"))
 
@@ -34,14 +33,18 @@ def test_documentation_build_covers_student_and_site_outputs(tmp_path: Path) -> 
     assert "> **Note — Learning goal**" in readme
     assert "!!! note" not in readme
     assert (result.readme.parent / "assets" / "lab-diagram.svg").is_file()
-    assert "https://example.com/minimal-lab/releases/v1/source/src/lab_project/dynamics/unicycle.py.html#L7-L8" in site_markdown
+    assert (
+        "https://example.com/minimal-lab/releases/v1/source/src/lab_project/"
+        "dynamics/unicycle.py.html#L7-L8"
+    ) in site_html
     source_page = result.site / "source/src/lab_project/dynamics/unicycle.py.html"
     assert source_page.is_file()
     source_page_text = source_page.read_text(encoding="utf-8")
     assert 'id="L7-L8"' in source_page_text
     assert 'id="L7"' in source_page_text
     assert "https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js" in site_html
-    assert '<aside class="admonition note">' in site_html
+    assert '<meta name="generator" content="mkdocs-' in site_html
+    assert '<div class="admonition note">' in site_html
     assert '<div class="arithmatex">\\[' in site_html
     assert "\\begin{bmatrix}" in site_html
     assert index["exercises"][0]["source"]["start_line"] == 7
@@ -72,11 +75,120 @@ def test_nested_assets_and_protected_asset_examples_are_preserved(tmp_path: Path
 
     result = build_documentation(project)
     readme = result.readme.read_text(encoding="utf-8")
-    site = (result.site / "index.md").read_text(encoding="utf-8")
+    site = (result.site / "index.html").read_text(encoding="utf-8")
     assert "assets/figures/plot.svg" in readme
     assert "assets/figures/plot.svg" in site
     assert (result.readme.parent / "assets" / "figures" / "plot.svg").is_file()
     assert "assets/not-copied.svg" in readme
+
+
+def test_material_site_supports_configured_navigation_and_pages(
+    tmp_path: Path,
+) -> None:
+    project = copy_fixture(tmp_path)
+    pages = project / "teaching" / "pages"
+    guide = pages / "guides" / "first-exercise.md"
+    guide.parent.mkdir(parents=True)
+    guide.write_text(
+        """# First exercise
+
+Use the generated source link below.
+
+{{ exercise("unicycle-dynamics") }}
+
+![Lab diagram](assets/lab-diagram.svg)
+""",
+        encoding="utf-8",
+    )
+    stylesheet = pages / "stylesheets" / "extra.css"
+    stylesheet.parent.mkdir()
+    stylesheet.write_text(":root { --lab-accent: #ffcb05; }\n", encoding="utf-8")
+    site_config = project / "teaching" / "mkdocs.yml"
+    site_config.write_text(
+        """site_name: Replaced by startergen
+theme:
+  name: material
+nav:
+  - Home: index.md
+  - First exercise: guides/first-exercise.md
+plugins:
+  - search
+extra_css:
+  - stylesheets/extra.css
+""",
+        encoding="utf-8",
+    )
+    config = project / "teaching" / "config.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  readme_template: teaching/templates/README.md.j2\n",
+            "  readme_template: teaching/templates/README.md.j2\n"
+            "  pages: teaching/pages\n"
+            "  site_config: teaching/mkdocs.yml\n",
+        ),
+        encoding="utf-8",
+    )
+
+    result = build_documentation(project)
+
+    page = result.site / "guides" / "first-exercise" / "index.html"
+    html = page.read_text(encoding="utf-8")
+    assert "First exercise" in html
+    assert (
+        "https://example.com/minimal-lab/releases/v1/source/src/lab_project/"
+        "dynamics/unicycle.py.html#L7-L8"
+    ) in html
+    assert "../../assets/lab-diagram.svg" in html
+    assert (result.site / "stylesheets" / "extra.css").is_file()
+    assert (
+        '<link rel="canonical" href="https://example.com/minimal-lab/releases/'
+        'v1/guides/first-exercise/">'
+    ) in html
+
+
+def test_reserved_site_page_path_is_rejected(tmp_path: Path) -> None:
+    project = copy_fixture(tmp_path)
+    pages = project / "teaching" / "pages"
+    pages.mkdir()
+    (pages / "index.md").write_text("# Collision\n", encoding="utf-8")
+    config = project / "teaching" / "config.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  readme_template: teaching/templates/README.md.j2\n",
+            "  readme_template: teaching/templates/README.md.j2\n"
+            "  pages: teaching/pages\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DocumentationError) as error:
+        build_documentation(project)
+
+    assert error.value.code == "site_path_collision"
+
+
+def test_invalid_mkdocs_config_is_reported_as_documentation_error(
+    tmp_path: Path,
+) -> None:
+    project = copy_fixture(tmp_path)
+    site_config = project / "teaching" / "mkdocs.yml"
+    site_config.write_text(
+        "site_name: Broken\ntheme:\n  name: missing-theme\n", encoding="utf-8"
+    )
+    config = project / "teaching" / "config.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "  readme_template: teaching/templates/README.md.j2\n",
+            "  readme_template: teaching/templates/README.md.j2\n"
+            "  site_config: teaching/mkdocs.yml\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DocumentationError) as error:
+        build_documentation(project)
+
+    assert error.value.code == "site_build_failed"
 
 
 def test_allowlisted_assets_are_merged_without_loss(tmp_path: Path) -> None:
@@ -141,15 +253,18 @@ def test_background_and_starter_links_are_rewritten_per_output(tmp_path: Path) -
 
     result = build_documentation(project)
     readme = result.readme.read_text(encoding="utf-8")
-    site = (result.site / "index.md").read_text(encoding="utf-8")
+    site = (result.site / "index.html").read_text(encoding="utf-8")
     assert "[Theory](background/theory.md)" in readme
-    assert "[Theory](background/theory.md)" in site
+    assert 'href="background/theory/">Theory</a>' in site
     assert "[Data](background/data.csv?download=1)" in readme
-    assert "[Data](background/data.csv?download=1)" in site
+    assert 'href="background/data.csv?download=1">Data</a>' in site
     assert "[Implementation](src/lab_project/dynamics/unicycle.py)" in readme
-    assert "[Implementation](source/src/lab_project/dynamics/unicycle.py)" in site
+    assert (
+        'href="source/src/lab_project/dynamics/unicycle.py">Implementation</a>'
+        in site
+    )
     assert (result.readme.parent / "background" / "theory.md").is_file()
-    assert (result.site / "background" / "theory.md").is_file()
+    assert (result.site / "background" / "theory" / "index.html").is_file()
 
 
 def test_unsupported_admonition_and_unclosed_inline_math_are_rejected(tmp_path: Path) -> None:

@@ -54,6 +54,8 @@ class DocumentationConfig(StrictModel):
     assets: str = Field(min_length=1)
     background: str = Field(min_length=1)
     readme_template: str = Field(min_length=1)
+    pages: str | None = Field(default=None, min_length=1)
+    site_config: str | None = Field(default=None, min_length=1)
     generated_source: str = Field(min_length=1)
     site_output: str = Field(min_length=1)
 

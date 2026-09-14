@@ -280,17 +280,22 @@ def test_documentation_update_is_atomic_and_latest_is_versioned(tmp_path: Path) 
     assert latest["release_id"] == "v1"
     assert latest["documentation_id"] == plan.documentation_id
     base_path = urlparse(plan.docs_base_url).path.rstrip("/") + "/"
-    published_markdown = "\n".join(
+    published_html = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (docs_root / "releases" / plan.release_id).rglob("*.md")
+        for path in (docs_root / "releases" / plan.release_id).rglob("*.html")
     )
-    published_links = re.findall(r"https://[^\s)]+", published_markdown)
+    published_links = re.findall(r'href="(https://[^"]+)"', published_html)
+    published_links = [
+        link for link in published_links if urlparse(link).path.startswith(base_path)
+    ]
     assert published_links
     for link in published_links:
         parsed = urlparse(link)
-        assert parsed.path.startswith(base_path)
         relative = parsed.path.removeprefix(base_path)
-        assert (docs_root / relative).is_file(), link
+        target = docs_root / relative
+        if parsed.path.endswith("/"):
+            target /= "index.html"
+        assert target.is_file(), link
 
 
 def test_occupied_release_directory_without_metadata_is_immutable(

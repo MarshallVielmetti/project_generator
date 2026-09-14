@@ -17,8 +17,10 @@ layout template.
 from __future__ import annotations
 
 import html
+import io
 import json
 import os
+import posixpath
 import re
 import shutil
 import tempfile
@@ -29,6 +31,9 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from jinja2 import Environment, StrictUndefined, TemplateError
+from mkdocs.commands.build import build as mkdocs_build
+from mkdocs.config import load_config as load_mkdocs_config
+from mkdocs.exceptions import MkDocsException
 from pydantic import ValidationError
 
 from startergen.assembly import (
@@ -48,6 +53,43 @@ MATHJAX_SCRIPT = (
     "https://cdn.jsdelivr.net/npm/"
     f"mathjax@{MATHJAX_VERSION}/es5/tex-mml-chtml.js"
 )
+
+_DEFAULT_MKDOCS_CONFIG = """\
+site_name: Starter project documentation
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.arithmatex:
+      generic: true
+  - toc:
+      permalink: true
+plugins:
+  - search
+extra_javascript:
+  - _startergen/mathjax-config.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js
+"""
+
+_SITE_RESERVED_PATHS = {"_startergen", "assets", "background", "index.md", "source"}
 
 _DIRECTIVE = re.compile(
     r'''^\s*\{\{\s*exercise\(\s*["'](?P<id>[a-z0-9]+(?:-[a-z0-9]+)*)["']\s*\)\s*\}\}\s*$'''
@@ -527,11 +569,17 @@ def _rewrite_local_links(
     source_file: Path,
     source_display: str,
     destination: str,
+    output_file: str = "index.md",
 ) -> str:
     """Map authoring-relative links to files copied into each output."""
 
     assets = project_path(root, config.documentation.assets)
     background = project_path(root, config.documentation.background)
+    pages = (
+        project_path(root, config.documentation.pages)
+        if config.documentation.pages is not None
+        else None
+    )
     assert assets is not None and background is not None
     published_files = {entry.path for entry in result.files}
     diagnostics: list[Diagnostic] = []
@@ -556,11 +604,16 @@ def _rewrite_local_links(
 
             background_relative = _relative_to(candidate, background)
             assets_relative = _relative_to(candidate, assets)
+            pages_relative = (
+                _relative_to(candidate, pages) if pages is not None else None
+            )
             root_relative = _relative_to(candidate, root)
             if background_relative is not None:
                 output_path = f"background/{background_relative}"
             elif assets_relative is not None:
                 output_path = f"assets/{assets_relative}"
+            elif pages_relative is not None and destination == "site":
+                output_path = pages_relative
             elif root_relative is not None and root_relative in published_files:
                 output_path = (
                     f"source/{root_relative}"
@@ -578,6 +631,10 @@ def _rewrite_local_links(
                     )
                 )
                 return match.group(0)
+            if destination == "site":
+                output_path = posixpath.relpath(
+                    output_path, start=posixpath.dirname(output_file) or "."
+                )
             encoded = quote(output_path, safe="/._-")
             suffix = f"?{parsed.query}" if parsed.query else ""
             suffix += f"#{parsed.fragment}" if parsed.fragment else ""
@@ -631,7 +688,9 @@ def _asset_relative_path(href: str, assets: Path) -> str:
         return path_part
 
 
-def _rewrite_assets(text: str, *, assets: Path) -> str:
+def _rewrite_assets(
+    text: str, *, assets: Path, output_file: str = "index.md"
+) -> str:
     def rewrite_line(line: str) -> str:
         protected = [match.span() for match in _PROTECTED.finditer(line)]
 
@@ -643,7 +702,10 @@ def _rewrite_assets(text: str, *, assets: Path) -> str:
             if parsed.scheme or href.startswith("#"):
                 return match.group(0)
             relative = _asset_relative_path(href, assets)
-            return f"![{alt}](assets/{relative})"
+            output_path = posixpath.relpath(
+                f"assets/{relative}", start=posixpath.dirname(output_file) or "."
+            )
+            return f"![{alt}]({quote(output_path, safe='/._-')})"
 
         return _IMAGE.sub(replace, line)
 
@@ -827,181 +889,66 @@ def render_readme(
     return rendered_template.rstrip() + "\n\n" + content.lstrip()
 
 
-def _inline_html(value: str) -> str:
-    pattern = re.compile(
-        r"!\[([^\]]*)\]\(([^)]+)\)|\[([^\]]+)\]\(([^)]+)\)|`([^`]+)`|"
-        r"(\\\([^\n]*?\\\)|\$[^$\n]+\$)"
+def _build_mkdocs_site(
+    docs_dir: Path,
+    site_dir: Path,
+    *,
+    title: str,
+    site_url: str | None,
+    config_file: Path | None,
+) -> None:
+    """Build one strict Material for MkDocs site into *site_dir*."""
+
+    source: str | io.BytesIO
+    if config_file is None:
+        source = io.BytesIO(_DEFAULT_MKDOCS_CONFIG.encode("utf-8"))
+    else:
+        source = str(config_file)
+    try:
+        config = load_mkdocs_config(
+            source,
+            docs_dir=str(docs_dir),
+            site_dir=str(site_dir),
+            site_name=title,
+            site_url=site_url,
+            strict=True,
+            use_directory_urls=True,
+        )
+        mkdocs_build(config)
+    except (MkDocsException, OSError, ValueError) as exc:
+        raise DocumentationError(
+            "site_build_failed",
+            "Material for MkDocs could not build the generated documentation site",
+            cause=exc,
+        ) from exc
+
+
+def _write_mathjax_config(destination: Path) -> None:
+    destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    destination.write_text(
+        "window.MathJax = {tex: {inlineMath: [['\\\\(', '\\\\)'], ['$', '$']]}};\n",
+        encoding="utf-8",
     )
-    result: list[str] = []
-    fragments: list[str] = []
-
-    def add_fragment(fragment: str) -> None:
-        token = f"\x00startergen-fragment-{len(fragments)}\x00"
-        fragments.append(fragment)
-        result.append(token)
-
-    cursor = 0
-    for match in pattern.finditer(value):
-        result.append(html.escape(value[cursor : match.start()]))
-        if match.group(1) is not None:
-            add_fragment(
-                f'<img src="{html.escape(match.group(2), quote=True)}" '
-                f'alt="{html.escape(match.group(1), quote=True)}">'
-            )
-        elif match.group(3) is not None:
-            add_fragment(
-                f'<a href="{html.escape(match.group(4), quote=True)}">'
-                f"{html.escape(match.group(3))}</a>"
-            )
-        elif match.group(5) is not None:
-            add_fragment(f"<code>{html.escape(match.group(5))}</code>")
-        else:
-            add_fragment(f'<span class="arithmatex">{html.escape(match.group(6))}</span>')
-        cursor = match.end()
-    result.append(html.escape(value[cursor:]))
-    rendered = "".join(result)
-    rendered = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", rendered)
-    rendered = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", rendered)
-    for index, fragment in enumerate(fragments):
-        rendered = rendered.replace(f"\x00startergen-fragment-{index}\x00", fragment)
-    return rendered
 
 
 def render_site(source_markdown: str, *, title: str) -> tuple[str, str]:
-    """Render MkDocs-compatible Markdown and a deterministic static preview."""
+    """Render one Markdown page with the default Material for MkDocs theme."""
 
-    markdown = source_markdown
-    lines = markdown.splitlines()
-    output: list[str] = []
-    paragraph: list[str] = []
-    fence: tuple[str, str] | None = None
-    math_block: list[str] | None = None
-    index = 0
-
-    def flush_paragraph() -> None:
-        if paragraph:
-            output.append(f"<p>{_inline_html(' '.join(paragraph))}</p>")
-            paragraph.clear()
-
-    while index < len(lines):
-        line = lines[index]
-        fence_match = _FENCE.match(line)
-        if fence is not None:
-            if fence_match and fence_match.group("mark")[0] == fence[0]:
-                output.append("</code></pre>")
-                fence = None
-            else:
-                output.append(html.escape(line))
-            index += 1
-            continue
-        if fence_match is not None:
-            flush_paragraph()
-            info = fence_match.group("info").strip()
-            language = f' class="language-{html.escape(info)}"' if info else ""
-            output.append(f"<pre><code{language}>")
-            fence = (fence_match.group("mark")[0], info)
-            index += 1
-            continue
-        if math_block is not None:
-            if line.strip() == "$$":
-                output.append(
-                    '<div class="arithmatex">\\[ '
-                    + html.escape(" ".join(math_block))
-                    + r" \]</div>"
-                )
-                math_block = None
-            else:
-                math_block.append(line.strip())
-            index += 1
-            continue
-        if line.strip() == "$$":
-            flush_paragraph()
-            math_block = []
-            index += 1
-            continue
-        if line.strip().startswith("$$") and line.strip().endswith("$$"):
-            flush_paragraph()
-            content = line.strip()[2:-2].strip()
-            output.append(
-                '<div class="arithmatex">\\[ '
-                + html.escape(content)
-                + r" \]</div>"
-            )
-            index += 1
-            continue
-        admonition = re.match(r'^\s*!{3}\s+(note|warning|tip)(?:\s+"([^"]+)")?\s*$', line)
-        if admonition:
-            flush_paragraph()
-            body: list[str] = []
-            index += 1
-            while index < len(lines):
-                candidate = lines[index]
-                if candidate.startswith("    "):
-                    body.append(candidate[4:])
-                    index += 1
-                elif not candidate.strip():
-                    body.append("")
-                    index += 1
-                else:
-                    break
-            heading = admonition.group(2) or admonition.group(1).title()
-            output.append(
-                f'<aside class="admonition {admonition.group(1)}">'
-                f"<h3>{html.escape(heading)}</h3>"
-                f"<p>{_inline_html(' '.join(body).strip())}</p></aside>"
-            )
-            continue
-        heading = _HEADING.match(line)
-        if heading:
-            flush_paragraph()
-            level = len(heading.group("marks"))
-            text = heading.group("title").strip().rstrip("#").strip()
-            output.append(
-                f'<h{level} id="{html.escape(_slugify(text), quote=True)}">'
-                f"{_inline_html(text)}</h{level}>"
-            )
-            index += 1
-            continue
-        if not line.strip():
-            flush_paragraph()
-            index += 1
-            continue
-        list_match = re.match(r"^\s*[-*+]\s+(.+)$", line)
-        if list_match:
-            flush_paragraph()
-            items = [list_match.group(1)]
-            index += 1
-            while index < len(lines):
-                next_match = re.match(r"^\s*[-*+]\s+(.+)$", lines[index])
-                if next_match is None:
-                    break
-                items.append(next_match.group(1))
-                index += 1
-            output.append("<ul>" + "".join(f"<li>{_inline_html(item)}</li>" for item in items) + "</ul>")
-            continue
-        paragraph.append(line.strip())
-        index += 1
-    flush_paragraph()
-    if fence is not None:
-        raise DocumentationError("unclosed_fence", "site preview encountered an unclosed code fence")
-    if math_block is not None:
-        raise DocumentationError("unclosed_math", "site preview encountered an unclosed display math block")
-    body = "\n".join(output)
-    html_page = f'''<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{html.escape(title)}</title>
-<script>window.MathJax = {{tex: {{inlineMath: [['\\\\(', '\\\\)'], ['$', '$']]}}}};</script>
-<script async src="{MATHJAX_SCRIPT}"></script>
-</head>
-<body>
-{body}
-</body>
-</html>
-'''
-    return markdown, html_page
+    with tempfile.TemporaryDirectory(prefix="startergen-mkdocs-") as temporary:
+        root = Path(temporary)
+        docs_dir = root / "docs"
+        site_dir = root / "site"
+        docs_dir.mkdir()
+        (docs_dir / "index.md").write_text(source_markdown, encoding="utf-8")
+        _write_mathjax_config(docs_dir / "_startergen" / "mathjax-config.js")
+        _build_mkdocs_site(
+            docs_dir,
+            site_dir,
+            title=title,
+            site_url=None,
+            config_file=None,
+        )
+        return source_markdown, (site_dir / "index.html").read_text(encoding="utf-8")
 
 
 def _copy_tree(source: Path, destination: Path) -> None:
@@ -1018,6 +965,45 @@ def _copy_tree(source: Path, destination: Path) -> None:
         elif path.is_file():
             target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
             shutil.copy2(path, target)
+
+
+def _site_page_sources(
+    root: Path, config: ProjectMetadata
+) -> tuple[tuple[Path, str], ...]:
+    """Return additional Markdown pages and reject generated-path collisions."""
+
+    if config.documentation.pages is None:
+        return ()
+    pages = project_path(root, config.documentation.pages)
+    assert pages is not None
+    if not pages.is_dir():
+        raise DocumentationError(
+            "pages_not_directory",
+            f"documentation.pages must name a directory: {config.documentation.pages}",
+        )
+    markdown: list[tuple[Path, str]] = []
+    for path in sorted(
+        pages.rglob("*"), key=lambda item: item.relative_to(pages).as_posix()
+    ):
+        relative = path.relative_to(pages)
+        if relative.parts and relative.parts[0].casefold() in _SITE_RESERVED_PATHS:
+            raise DocumentationError(
+                "site_path_collision",
+                f"documentation.pages uses reserved generated path: {relative}",
+            )
+        if path.is_file() and path.suffix.casefold() in {".md", ".markdown"}:
+            markdown.append((path, relative.as_posix()))
+    return tuple(markdown)
+
+
+def _documentation_site_url(config: ProjectMetadata) -> str | None:
+    publication = config.publication
+    if publication is None:
+        return None
+    return (
+        f"{publication.docs_base_url.rstrip('/')}/releases/"
+        f"{publication.release_id}/"
+    )
 
 
 def _merge_tree(source: Path, destination: Path) -> None:
@@ -1248,6 +1234,16 @@ def build_documentation(
     template_path = project_path(root, config.documentation.readme_template)
     assets = project_path(root, config.documentation.assets)
     background = project_path(root, config.documentation.background)
+    pages = (
+        project_path(root, config.documentation.pages)
+        if config.documentation.pages is not None
+        else None
+    )
+    site_config = (
+        project_path(root, config.documentation.site_config)
+        if config.documentation.site_config is not None
+        else None
+    )
     generated_source = project_path(root, config.documentation.generated_source)
     site = project_path(root, config.documentation.site_output)
     assert (
@@ -1258,16 +1254,46 @@ def build_documentation(
         and generated_source is not None
         and site is not None
     )
+    if site_config is not None and not site_config.is_file():
+        raise DocumentationError(
+            "site_config_not_file",
+            f"documentation.site_config must name a file: {config.documentation.site_config}",
+        )
+    page_sources = _site_page_sources(root, config)
     try:
         source_markdown = source_path.read_text(encoding="utf-8")
         template = template_path.read_text(encoding="utf-8")
+        page_markdown = {
+            output_file: path.read_text(encoding="utf-8")
+            for path, output_file in page_sources
+        }
     except OSError as exc:
         raise DocumentationError("documentation_read_failed", "documentation inputs could not be read", cause=exc) from exc
     source_display = source_path.relative_to(root).as_posix()
     parsed = parse_markdown(source_markdown, file=source_display)
-    _validate_references(root, config, parsed, source_file=source_path, source_display=source_display)
+    _validate_references(
+        root,
+        config,
+        parsed,
+        source_file=source_path,
+        source_display=source_display,
+    )
     if check_external_links:
         _check_external_links(parsed.external_links, source_file=source_display)
+    for page_path, output_file in page_sources:
+        page_display = page_path.relative_to(root).as_posix()
+        parsed_page = parse_markdown(page_markdown[output_file], file=page_display)
+        _validate_references(
+            root,
+            config,
+            parsed_page,
+            source_file=page_path,
+            source_display=page_display,
+        )
+        if check_external_links:
+            _check_external_links(
+                parsed_page.external_links, source_file=page_display
+            )
 
     placeholders = _placeholder_links(exercises)
     render_readme(
@@ -1279,7 +1305,7 @@ def build_documentation(
         assets=assets,
         source_file=source_display,
     )
-    preflight_site_source = _rewrite_assets(
+    _ = _rewrite_assets(
         _rewrite_exercises(
             source_markdown,
             links=placeholders,
@@ -1288,7 +1314,17 @@ def build_documentation(
         ),
         assets=assets,
     )
-    render_site(preflight_site_source, title=config.project.name)
+    for page_path, output_file in page_sources:
+        _rewrite_assets(
+            _rewrite_exercises(
+                page_markdown[output_file],
+                links=placeholders,
+                href_name="site_href",
+                source_file=page_path.relative_to(root).as_posix(),
+            ),
+            assets=assets,
+            output_file=output_file,
+        )
 
     starter_output = project_path(root, config.starter.output)
     assert starter_output is not None
@@ -1333,6 +1369,7 @@ def build_documentation(
             source_file=source_path,
             source_display=source_display,
             destination="site",
+            output_file="index.md",
         )
         site_source = _rewrite_assets(
             _rewrite_exercises(
@@ -1342,8 +1379,31 @@ def build_documentation(
                 source_file=source_display,
             ),
             assets=assets,
+            output_file="index.md",
         )
-        site_markdown, site_html = render_site(site_source, title=config.project.name)
+        site_pages: dict[str, str] = {}
+        for page_path, output_file in page_sources:
+            page_display = page_path.relative_to(root).as_posix()
+            page_source = _rewrite_local_links(
+                page_markdown[output_file],
+                root=root,
+                config=config,
+                result=result,
+                source_file=page_path,
+                source_display=page_display,
+                destination="site",
+                output_file=output_file,
+            )
+            site_pages[output_file] = _rewrite_assets(
+                _rewrite_exercises(
+                    page_source,
+                    links=links,
+                    href_name="site_href",
+                    source_file=page_display,
+                ),
+                assets=assets,
+                output_file=output_file,
+            )
 
         starter_readme = result.output / "README.md"
         _merge_tree(assets, result.output / "assets")
@@ -1375,15 +1435,32 @@ def build_documentation(
             )
 
         def write_site(destination: Path) -> None:
-            _copy_anchored_sources(result.output, destination / "source", links)
-            _copy_tree(assets, destination / "assets")
-            _copy_tree(background, destination / "background")
-            (destination / "index.md").write_text(site_markdown, encoding="utf-8")
-            (destination / "index.html").write_text(site_html, encoding="utf-8")
-            (destination / "mathjax-config.js").write_text(
-                "window.MathJax = {tex: {inlineMath: [['\\\\(', '\\\\)'], ['$', '$']]}};\n",
-                encoding="utf-8",
+            docs_dir = Path(
+                tempfile.mkdtemp(prefix=".startergen-site-source-", dir=site.parent)
             )
+            try:
+                if pages is not None:
+                    _copy_tree(pages, docs_dir)
+                (docs_dir / "index.md").write_text(site_source, encoding="utf-8")
+                for output_file, content in site_pages.items():
+                    page = docs_dir.joinpath(*output_file.split("/"))
+                    page.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+                    page.write_text(content, encoding="utf-8")
+                _copy_anchored_sources(result.output, docs_dir / "source", links)
+                _copy_tree(assets, docs_dir / "assets")
+                _copy_tree(background, docs_dir / "background")
+                _write_mathjax_config(
+                    docs_dir / "_startergen" / "mathjax-config.js"
+                )
+                _build_mkdocs_site(
+                    docs_dir,
+                    destination,
+                    title=config.project.name,
+                    site_url=_documentation_site_url(config),
+                    config_file=site_config,
+                )
+            finally:
+                shutil.rmtree(docs_dir, ignore_errors=True)
 
         _replace_directory(generated_source, write_generated)
         _replace_directory(site, write_site)
