@@ -12,7 +12,7 @@ exercises:
       body: null
     tests:
       public:
-        - tests/public/cases.py::test_forward_motion
+        - tests/public/test_unicycle.py::test_forward_motion
       baseline:
-        - nodeid: tests/public/cases.py::test_forward_motion
+        - nodeid: tests/public/test_unicycle.py::test_forward_motion
           expected: stub_error

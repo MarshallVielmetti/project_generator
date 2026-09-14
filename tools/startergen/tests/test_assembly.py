@@ -38,7 +38,7 @@ def test_build_assembles_transforms_and_writes_deterministic_manifest(
     assert "NotImplementedError" in (
         output / "src/lab_project/dynamics/unicycle.py"
     ).read_text(encoding="utf-8")
-    assert (output / "tests/public/cases.py").is_file()
+    assert (output / "tests/public/test_unicycle.py").is_file()
     assert not (output / "teaching").exists()
     assert not (output / "tools").exists()
     assert not any("__pycache__" in path.parts for path in output.rglob("*"))
@@ -83,7 +83,7 @@ def test_allowlist_skips_denied_descendants(tmp_path: Path) -> None:
 
     result = build_project(project)
 
-    assert (result.output / "tests/public/cases.py").exists()
+    assert (result.output / "tests/public/test_unicycle.py").exists()
     assert not (result.output / "tests/instructor").exists()
     assert not (result.output / "tests/generation").exists()
     assert not (result.output / "tests/public/.env").exists()
@@ -152,7 +152,8 @@ def test_duplicate_allowlist_outputs_fail_before_promotion(tmp_path: Path) -> No
     text = _config(project).read_text(encoding="utf-8")
     _config(project).write_text(
         text.replace(
-            "    - tests/public\n", "    - tests/public\n    - tests/public/cases.py\n"
+            "    - tests/public\n",
+            "    - tests/public\n    - tests/public/test_unicycle.py\n",
         ),
         encoding="utf-8",
     )

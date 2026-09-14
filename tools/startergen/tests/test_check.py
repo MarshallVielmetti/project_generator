@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+import conftest
 import pytest
 import startergen.check as check_module
 from startergen.assembly import AssemblyError
@@ -20,6 +24,7 @@ from startergen.cli import main
 from startergen.documentation import DocumentationError
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mvp_canonical_project"
+MINIMAL_FIXTURE = Path(__file__).parent / "fixtures" / "minimal_completed_project"
 
 
 def copy_fixture(tmp_path: Path) -> Path:
@@ -32,24 +37,75 @@ def copy_fixture(tmp_path: Path) -> Path:
     return destination
 
 
-def test_check_cli_validates_mvp_end_to_end(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("fixture", "dependency_order"),
+    [
+        (MINIMAL_FIXTURE, ["unicycle-dynamics"]),
+        (FIXTURE, ["mean-function", "integrator-step", "rollout"]),
+    ],
+)
+def test_check_cli_validates_both_canonical_fixtures(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    fixture: Path,
+    dependency_order: list[str],
 ) -> None:
-    project = copy_fixture(tmp_path)
+    project = tmp_path / "project"
+    shutil.copytree(
+        fixture,
+        project,
+        ignore=shutil.ignore_patterns("build", ".pytest_cache", "__pycache__"),
+    )
 
     assert main(["check", "--root", str(project), "--json"]) == 0
 
     output = capsys.readouterr().out
     report = json.loads(output)
     assert report["checked"] is True
-    assert report["dependency_order"] == [
-        "mean-function",
-        "integrator-step",
-        "rollout",
-    ]
+    assert report["dependency_order"] == dependency_order
     assert report["starter"]["installed"] is True
     assert report["starter"]["completed_public"] == "passed"
     assert report["reproducible"] is True
+    assert not (fixture / "build").exists()
+
+
+def test_fixture_collection_guard_accepts_new_project_names(tmp_path: Path) -> None:
+    new_fixture_test = (
+        tmp_path / "tests" / "fixtures" / "new_project" / "test_example.py"
+    )
+    ordinary_test = tmp_path / "tests" / "test_example.py"
+    generator_config = SimpleNamespace(invocation_params=SimpleNamespace(dir=tmp_path))
+    fixture_config = SimpleNamespace(
+        invocation_params=SimpleNamespace(dir=new_fixture_test.parent.parent)
+    )
+
+    assert conftest.pytest_ignore_collect(new_fixture_test, generator_config) is True
+    assert conftest.pytest_ignore_collect(ordinary_test, generator_config) is False
+    assert conftest.pytest_ignore_collect(new_fixture_test, fixture_config) is False
+
+
+def test_documented_runner_leaves_checked_in_fixtures_clean() -> None:
+    repository_root = Path(__file__).resolve().parents[3]
+    runner = (
+        repository_root
+        / "tools"
+        / "startergen"
+        / "scripts"
+        / "check_canonical_fixtures.py"
+    )
+    result = subprocess.run(
+        [sys.executable, str(runner)],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    reports = json.loads(result.stdout)
+    assert all(report["checked"] for report in reports.values())
+    assert not (MINIMAL_FIXTURE / "build").exists()
+    assert not (FIXTURE / "build").exists()
 
 
 def test_case_does_not_reuse_a_stale_junit_report(

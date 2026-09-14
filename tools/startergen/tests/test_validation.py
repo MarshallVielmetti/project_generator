@@ -112,16 +112,16 @@ exercises:
     requires: [second]
     starter: {strategy: replace_body, docstring: preserve}
     tests:
-      public: [tests/public/cases.py::test_forward_motion]
-      baseline: [{nodeid: tests/public/cases.py::test_forward_motion, expected: stub_error}]
+      public: [tests/public/test_unicycle.py::test_forward_motion]
+      baseline: [{nodeid: tests/public/test_unicycle.py::test_forward_motion, expected: stub_error}]
   - id: second
     title: Second
     source: {file: src/lab_project/dynamics/unicycle.py, symbol: UnicycleDynamics.f}
     requires: [first]
     starter: {strategy: replace_body, docstring: preserve}
     tests:
-      public: [tests/public/cases.py::test_forward_motion]
-      baseline: [{nodeid: tests/public/cases.py::test_forward_motion, expected: stub_error}]
+      public: [tests/public/test_unicycle.py::test_forward_motion]
+      baseline: [{nodeid: tests/public/test_unicycle.py::test_forward_motion, expected: stub_error}]
 """,
     )
     report = validate_project(project)

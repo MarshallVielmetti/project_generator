@@ -106,3 +106,22 @@ independent retry status in `build/release/<release_id>/transaction.json`.
 
 The issue #6 design record is in
 [`IMPLEMENATION/ISSUE_6_DESIGN.md`](../../IMPLEMENATION/ISSUE_6_DESIGN.md).
+
+## Reuse across canonical projects
+
+The same installed generator is checked against both the minimal and MVP
+canonical fixtures. The reusable-project contract requires standard pytest
+discovery, project-owned configuration and exercise metadata, isolated
+installation, completed public tests, and deterministic outputs without
+project-specific branches in `startergen`.
+
+The issue #7 design record is in
+[`IMPLEMENATION/ISSUE_7_DESIGN.md`](../../IMPLEMENATION/ISSUE_7_DESIGN.md).
+
+To run the reusable-project checks without writing generated outputs into the
+checked-in fixtures, use:
+
+```bash
+uv run --project tools/startergen python \
+  tools/startergen/scripts/check_canonical_fixtures.py
+```
