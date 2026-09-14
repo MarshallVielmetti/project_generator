@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import conftest
 import pytest
@@ -73,9 +74,14 @@ def test_fixture_collection_guard_accepts_new_project_names(tmp_path: Path) -> N
         tmp_path / "tests" / "fixtures" / "new_project" / "test_example.py"
     )
     ordinary_test = tmp_path / "tests" / "test_example.py"
+    generator_config = SimpleNamespace(invocation_params=SimpleNamespace(dir=tmp_path))
+    fixture_config = SimpleNamespace(
+        invocation_params=SimpleNamespace(dir=new_fixture_test.parent.parent)
+    )
 
-    assert conftest.pytest_ignore_collect(new_fixture_test, object()) is True
-    assert conftest.pytest_ignore_collect(ordinary_test, object()) is False
+    assert conftest.pytest_ignore_collect(new_fixture_test, generator_config) is True
+    assert conftest.pytest_ignore_collect(ordinary_test, generator_config) is False
+    assert conftest.pytest_ignore_collect(new_fixture_test, fixture_config) is False
 
 
 def test_documented_runner_leaves_checked_in_fixtures_clean() -> None:
