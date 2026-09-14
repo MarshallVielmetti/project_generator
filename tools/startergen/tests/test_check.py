@@ -20,6 +20,7 @@ from startergen.cli import main
 from startergen.documentation import DocumentationError
 
 FIXTURE = Path(__file__).parent / "fixtures" / "mvp_canonical_project"
+MINIMAL_FIXTURE = Path(__file__).parent / "fixtures" / "minimal_completed_project"
 
 
 def copy_fixture(tmp_path: Path) -> Path:
@@ -32,21 +33,32 @@ def copy_fixture(tmp_path: Path) -> Path:
     return destination
 
 
-def test_check_cli_validates_mvp_end_to_end(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("fixture", "dependency_order"),
+    [
+        (MINIMAL_FIXTURE, ["unicycle-dynamics"]),
+        (FIXTURE, ["mean-function", "integrator-step", "rollout"]),
+    ],
+)
+def test_check_cli_validates_both_canonical_fixtures(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    fixture: Path,
+    dependency_order: list[str],
 ) -> None:
-    project = copy_fixture(tmp_path)
+    project = tmp_path / "project"
+    shutil.copytree(
+        fixture,
+        project,
+        ignore=shutil.ignore_patterns("build", ".pytest_cache", "__pycache__"),
+    )
 
     assert main(["check", "--root", str(project), "--json"]) == 0
 
     output = capsys.readouterr().out
     report = json.loads(output)
     assert report["checked"] is True
-    assert report["dependency_order"] == [
-        "mean-function",
-        "integrator-step",
-        "rollout",
-    ]
+    assert report["dependency_order"] == dependency_order
     assert report["starter"]["installed"] is True
     assert report["starter"]["completed_public"] == "passed"
     assert report["reproducible"] is True

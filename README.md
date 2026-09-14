@@ -107,3 +107,21 @@ aligned with `publication.branch`, and store a narrowly scoped
 
 Design decisions for issue #6 are recorded in
 [`IMPLEMENATION/ISSUE_6_DESIGN.md`](IMPLEMENATION/ISSUE_6_DESIGN.md).
+
+## Reuse across a second canonical project
+
+Milestone 7 verifies that the same installed generator supports the distinct
+`minimal_completed_project` and `mvp_canonical_project` canonical fixtures.
+Each project supplies its own source tree, teaching metadata, exercise tests,
+packaging inputs, documentation, and publication settings; the generator has
+no project-specific branches. Run the full reusable-project check with:
+
+```bash
+uv run --project tools/startergen startergen check \
+  --root tools/startergen/tests/fixtures/minimal_completed_project --json
+uv run --project tools/startergen startergen check \
+  --root tools/startergen/tests/fixtures/mvp_canonical_project --json
+```
+
+The design decisions for issue #7 are recorded in
+[`IMPLEMENATION/ISSUE_7_DESIGN.md`](IMPLEMENATION/ISSUE_7_DESIGN.md).
