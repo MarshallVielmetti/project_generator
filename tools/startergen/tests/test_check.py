@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
+import conftest
 import pytest
 import startergen.check as check_module
 from startergen.assembly import AssemblyError
@@ -62,6 +65,41 @@ def test_check_cli_validates_both_canonical_fixtures(
     assert report["starter"]["installed"] is True
     assert report["starter"]["completed_public"] == "passed"
     assert report["reproducible"] is True
+    assert not (fixture / "build").exists()
+
+
+def test_fixture_collection_guard_accepts_new_project_names(tmp_path: Path) -> None:
+    new_fixture_test = (
+        tmp_path / "tests" / "fixtures" / "new_project" / "test_example.py"
+    )
+    ordinary_test = tmp_path / "tests" / "test_example.py"
+
+    assert conftest.pytest_ignore_collect(new_fixture_test, object()) is True
+    assert conftest.pytest_ignore_collect(ordinary_test, object()) is False
+
+
+def test_documented_runner_leaves_checked_in_fixtures_clean() -> None:
+    repository_root = Path(__file__).resolve().parents[3]
+    runner = (
+        repository_root
+        / "tools"
+        / "startergen"
+        / "scripts"
+        / "check_canonical_fixtures.py"
+    )
+    result = subprocess.run(
+        [sys.executable, str(runner)],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    reports = json.loads(result.stdout)
+    assert all(report["checked"] for report in reports.values())
+    assert not (MINIMAL_FIXTURE / "build").exists()
+    assert not (FIXTURE / "build").exists()
 
 
 def test_case_does_not_reuse_a_stale_junit_report(

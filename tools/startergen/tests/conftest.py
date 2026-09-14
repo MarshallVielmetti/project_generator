@@ -1,6 +1,10 @@
-"""Keep the canonical-project fixture out of the generator test collection."""
+"""Keep all canonical-project fixtures out of generator test collection."""
 
-collect_ignore = [
-    "fixtures/minimal_completed_project",
-    "fixtures/mvp_canonical_project",
-]
+from pathlib import Path
+
+
+def pytest_ignore_collect(collection_path: Path, config: object) -> bool:
+    """Run canonical fixture tests only through the integrated checker."""
+
+    del config
+    return "fixtures" in collection_path.parts

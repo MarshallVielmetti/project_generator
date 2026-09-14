@@ -22,11 +22,15 @@ The exercise metadata points at the renamed public test node, and the starter al
 
 The check test now runs the same installed generator command against both canonical fixtures and asserts each project's dependency order and completed public suite.
 
+The documented reusable-project runner copies both fixtures to a temporary workspace while excluding `build`, pytest caches, and bytecode caches before invoking those checks.
+
 The integrated check therefore exercises validation, canonical suites, artifact assembly, documentation generation, isolated package installation, baseline outcomes, restoration checkpoints, completed public tests, and reproducibility for both projects.
 
 No generator module contains a project name, import-package special case, exercise-id special case, or fixture-specific path branch.
 
 ## Output and maintenance boundary
+
+Canonical fixtures are ignored generically by the generator unit-test collector because their tests require each fixture's own source path and isolated runtime. The cross-project integration matrix copies each fixture and invokes the installed CLI explicitly, so onboarding another fixture does not require editing the collection guard.
 
 Generated starter, documentation, report, cache, and release outputs remain disposable build products and are excluded from the committed fixture inputs.
 

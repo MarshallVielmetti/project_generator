@@ -117,3 +117,11 @@ project-specific branches in `startergen`.
 
 The issue #7 design record is in
 [`IMPLEMENATION/ISSUE_7_DESIGN.md`](../../IMPLEMENATION/ISSUE_7_DESIGN.md).
+
+To run the reusable-project checks without writing generated outputs into the
+checked-in fixtures, use:
+
+```bash
+uv run --project tools/startergen python \
+  tools/startergen/scripts/check_canonical_fixtures.py
+```

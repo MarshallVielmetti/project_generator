@@ -114,13 +114,14 @@ Milestone 7 verifies that the same installed generator supports the distinct
 `minimal_completed_project` and `mvp_canonical_project` canonical fixtures.
 Each project supplies its own source tree, teaching metadata, exercise tests,
 packaging inputs, documentation, and publication settings; the generator has
-no project-specific branches. Run the full reusable-project check with:
+no project-specific branches. The check runner copies both fixtures to a
+temporary directory and removes generated outputs from the copies before
+running, so the checked-in fixtures remain clean. Run the full reusable-project
+check with:
 
 ```bash
-uv run --project tools/startergen startergen check \
-  --root tools/startergen/tests/fixtures/minimal_completed_project --json
-uv run --project tools/startergen startergen check \
-  --root tools/startergen/tests/fixtures/mvp_canonical_project --json
+uv run --project tools/startergen python \
+  tools/startergen/scripts/check_canonical_fixtures.py
 ```
 
 The design decisions for issue #7 are recorded in
