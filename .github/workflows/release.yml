@@ -1,0 +1,87 @@
+name: Publish starter release
+
+on:
+  workflow_dispatch:
+    inputs:
+      canonical_root:
+        description: Path to the canonical project root in this checkout
+        required: true
+      mark_template:
+        description: Mark the starter repository as a GitHub template after publication
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: starter-release-${{ vars.STARTER_REPOSITORY || github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Validate and publish immutable release
+    runs-on: ubuntu-latest
+    environment: starter-release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out canonical project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install the locked generator environment
+        run: uv sync --project tools/startergen --locked --group test
+
+      - name: Check out the dedicated starter repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.STARTER_REPOSITORY }}
+          ref: ${{ vars.STARTER_BRANCH || 'main' }}
+          path: .release/starter
+          token: ${{ secrets.STARTER_REPO_TOKEN }}
+
+      - name: Validate and publish starter and documentation artifacts
+        env:
+          STARTER_BRANCH: ${{ vars.STARTER_BRANCH || 'main' }}
+        run: >-
+          uv run --project tools/startergen startergen release
+          --root "${{ inputs.canonical_root }}"
+          --starter-worktree .release/starter
+          --docs-root "$RUNNER_TEMP/versioned-docs"
+          --expected-starter-branch "$STARTER_BRANCH"
+          --json
+
+      - name: Mark starter repository as a GitHub template
+        if: ${{ inputs.mark_template == true }}
+        env:
+          GH_TOKEN: ${{ secrets.STARTER_REPO_TOKEN }}
+        run: gh repo edit "${{ vars.STARTER_REPOSITORY }}" --template
+
+      - name: Upload versioned documentation
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/versioned-docs
+
+  pages:
+    name: Deploy documentation to GitHub Pages
+    needs: publish
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy documentation to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

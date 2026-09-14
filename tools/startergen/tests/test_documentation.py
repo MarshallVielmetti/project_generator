@@ -34,7 +34,7 @@ def test_documentation_build_covers_student_and_site_outputs(tmp_path: Path) -> 
     assert "> **Note — Learning goal**" in readme
     assert "!!! note" not in readme
     assert (result.readme.parent / "assets" / "lab-diagram.svg").is_file()
-    assert "https://example.com/minimal-lab/v1/source/src/lab_project/dynamics/unicycle.py.html#L7-L8" in site_markdown
+    assert "https://example.com/minimal-lab/releases/v1/source/src/lab_project/dynamics/unicycle.py.html#L7-L8" in site_markdown
     source_page = result.site / "source/src/lab_project/dynamics/unicycle.py.html"
     assert source_page.is_file()
     source_page_text = source_page.read_text(encoding="utf-8")

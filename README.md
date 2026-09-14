@@ -72,3 +72,38 @@ uv run --project tools/startergen startergen check \
 The representative three-exercise canonical project and its design decisions
 are documented in
 [`IMPLEMENATION/ISSUE_5_DESIGN.md`](IMPLEMENATION/ISSUE_5_DESIGN.md).
+
+## Publish a release
+
+After the integrated check passes, create a reviewable release plan without
+changing deployment targets:
+
+```bash
+uv run --project tools/startergen startergen release \
+  --root tools/startergen/tests/fixtures/mvp_canonical_project \
+  --dry-run --json
+```
+
+The transaction is written to
+`build/release/<release_id>/transaction.json`. A real release requires a clean
+checkout of the configured starter repository and a documentation deployment
+directory:
+
+```bash
+uv run --project tools/startergen startergen release \
+  --root . \
+  --starter-worktree /path/to/starter-checkout \
+  --docs-root /path/to/versioned-docs \
+  --json
+```
+
+The command verifies the pushed target branch and immutable release tag, writes
+`releases/<release_id>` and `latest` documentation trees atomically, and records
+independent retry state. The manual `Publish starter release` workflow supplies
+the target checkout token and deploys the versioned site through GitHub Pages.
+Configure the `STARTER_REPOSITORY` repository variable, keep `STARTER_BRANCH`
+aligned with `publication.branch`, and store a narrowly scoped
+`STARTER_REPO_TOKEN` in the `starter-release` environment before dispatching it.
+
+Design decisions for issue #6 are recorded in
+[`IMPLEMENATION/ISSUE_6_DESIGN.md`](IMPLEMENATION/ISSUE_6_DESIGN.md).

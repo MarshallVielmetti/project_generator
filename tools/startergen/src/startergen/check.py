@@ -102,6 +102,14 @@ def _clean_environment(*, pythonpath: Path | None = None, virtualenv: Path | Non
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
     environment.pop("PYTHONHOME", None)
+    for credential in (
+        "STARTER_REPO_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ):
+        environment.pop(credential, None)
     environment["PYTHONNOUSERSITE"] = "1"
     if pythonpath is not None:
         environment["PYTHONPATH"] = str(pythonpath)

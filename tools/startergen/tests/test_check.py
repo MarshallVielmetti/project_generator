@@ -82,6 +82,60 @@ def test_case_does_not_reuse_a_stale_junit_report(
     assert error.value.code == "test_report_missing"
 
 
+def test_validation_child_environment_excludes_publication_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    (project / "src").mkdir(parents=True)
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    nodeid = "tests/smoke/test_example.py::test_example"
+    seen: dict[str, str] = {}
+
+    for name in (
+        "STARTER_REPO_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ):
+        monkeypatch.setenv(name, "must-not-reach-validation")
+
+    def capture_environment(*args: object, **kwargs: object) -> None:
+        environment = kwargs["environment"]
+        assert isinstance(environment, dict)
+        seen.update(environment)
+        report_path = report_dir / (
+            check_module.hashlib.sha256(nodeid.encode()).hexdigest() + ".xml"
+        )
+        report_path.write_text(
+            '<testsuite><testcase classname="tests.smoke" name="test_example" />'
+            "</testsuite>",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(check_module, "_run_command", capture_environment)
+    result = _run_case(
+        _Runtime(tmp_path / "runtime", Path("python")),
+        project,
+        nodeid,
+        timeout=1,
+        report_dir=report_dir,
+    )
+
+    assert result.outcome == "passed"
+    assert all(
+        name not in seen
+        for name in (
+            "STARTER_REPO_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        )
+    )
+
+
 def test_reproducibility_uses_configured_output_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
