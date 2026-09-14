@@ -1,4 +1,4 @@
-# DASC Lab Starter Project
+# Project Generator
 
 This repository contains the maintainer-side tooling for producing validated
 teaching starter projects from a completed canonical project.
