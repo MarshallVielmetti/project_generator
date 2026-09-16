@@ -13,12 +13,14 @@ import startergen.check as check_module
 from startergen.assembly import AssemblyError
 from startergen.check import (
     CheckError,
+    _create_runtime,
     _load_contracts,
     _output_snapshot,
     _public_contracts,
     _run_case,
     _Runtime,
     _verify_reproducibility,
+    check_project,
 )
 from startergen.cli import main
 from startergen.documentation import DocumentationError
@@ -106,6 +108,90 @@ def test_documented_runner_leaves_checked_in_fixtures_clean() -> None:
     assert all(report["checked"] for report in reports.values())
     assert not (MINIMAL_FIXTURE / "build").exists()
     assert not (FIXTURE / "build").exists()
+
+
+@pytest.mark.parametrize("uv", ["/usr/bin/uv", None])
+def test_runtime_installers_include_project_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uv: str | None
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    commands: list[list[str]] = []
+
+    class FakeEnvBuilder:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        def create(self, path: Path) -> None:
+            python = path / "bin" / "python"
+            python.parent.mkdir(parents=True)
+            python.touch()
+
+    def capture_command(command: list[str], **kwargs: object) -> None:
+        del kwargs
+        commands.append(command)
+
+    monkeypatch.setattr(check_module.venv, "EnvBuilder", FakeEnvBuilder)
+    monkeypatch.setattr(check_module.shutil, "which", lambda _executable: uv)
+    monkeypatch.setattr(check_module, "_run_command", capture_command)
+
+    runtime = _create_runtime(
+        project,
+        package="example",
+        workspace=tmp_path / "runtime",
+        timeout=1,
+    )
+
+    assert runtime.python == tmp_path / "runtime" / "venv" / "bin" / "python"
+    if uv is not None:
+        assert commands[0] == [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(runtime.python),
+            str(project),
+        ]
+    else:
+        assert commands[0] == [
+            str(runtime.python),
+            "-m",
+            "pip",
+            "install",
+            str(project),
+        ]
+    assert "--no-deps" not in commands[0]
+
+
+def test_canonical_suite_uses_canonical_project_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _Runtime(Path("/isolated/canonical-runtime"), Path("/isolated/python"))
+    created_for: list[Path] = []
+
+    def create_runtime(project: Path, **kwargs: object) -> _Runtime:
+        del kwargs
+        created_for.append(project)
+        return runtime
+
+    def stop_after_canonical_suite(
+        python: Path, project: Path, nodes: list[str], **kwargs: object
+    ) -> None:
+        assert python == runtime.python
+        assert project == FIXTURE.resolve()
+        assert nodes == ["tests/private", "tests/public", "tests/smoke"]
+        assert kwargs["virtualenv"] == runtime.root / "venv"
+        assert kwargs["pythonpath"] == FIXTURE.resolve() / "src"
+        raise CheckError("canonical_suite_observed", "stop after canonical suite")
+
+    monkeypatch.setattr(check_module, "_create_runtime", create_runtime)
+    monkeypatch.setattr(check_module, "_run_suite", stop_after_canonical_suite)
+
+    with pytest.raises(CheckError) as error:
+        check_project(FIXTURE)
+
+    assert error.value.code == "canonical_suite_observed"
+    assert created_for == [FIXTURE.resolve()]
 
 
 def test_case_does_not_reuse_a_stale_junit_report(

@@ -1,9 +1,9 @@
 """Integrated MVP verification for canonical teaching projects.
 
-The checker deliberately treats the generated starter as a separate runtime:
-it installs the artifact into a temporary virtual environment, runs smoke and
-public tests from copied starter workspaces, and never imports the canonical
-checkout while validating student behavior.
+The checker installs both the canonical project and generated starter into
+separate temporary virtual environments. It runs starter smoke and public tests
+from copied workspaces and never imports the canonical checkout while
+validating student behavior.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import hashlib
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import venv
 from dataclasses import dataclass
@@ -308,12 +307,13 @@ def _run_suite(
 
 
 def _create_runtime(
-    starter: Path,
+    project: Path,
     *,
     package: str,
     workspace: Path,
     timeout: float,
 ) -> _Runtime:
+    """Install a project and its declared dependencies into an isolated venv."""
     venv_path = workspace / "venv"
     try:
         venv.EnvBuilder(with_pip=True, clear=True).create(venv_path)
@@ -329,7 +329,7 @@ def _create_runtime(
     if uv is not None:
         installer = [uv, "pip", "install", "--python", str(python)]
         _run_command(
-            [*installer, "--no-deps", str(starter)],
+            [*installer, str(project)],
             cwd=workspace,
             environment=environment,
             timeout=timeout,
@@ -344,7 +344,7 @@ def _create_runtime(
         )
     else:
         _run_command(
-            [str(python), "-m", "pip", "install", "--no-deps", str(starter)],
+            [str(python), "-m", "pip", "install", str(project)],
             cwd=workspace,
             environment=environment,
             timeout=timeout,
@@ -549,12 +549,19 @@ def check_project(root: Path, *, timeout: float = 60.0) -> CheckReport:
         workspace = Path(temporary)
         report_dir = workspace / "reports"
         report_dir.mkdir()
+        canonical_runtime = _create_runtime(
+            root,
+            package=config.project.import_package,
+            workspace=workspace / "canonical-runtime",
+            timeout=timeout,
+        )
         _run_suite(
-            Path(sys.executable),
+            canonical_runtime.python,
             root,
             canonical_nodes,
             timeout=timeout,
             report_dir=report_dir,
+            virtualenv=canonical_runtime.root / "venv",
             pythonpath=root / "src",
         )
         build_result = build_project(root)
