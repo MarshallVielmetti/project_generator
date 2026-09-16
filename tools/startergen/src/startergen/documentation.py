@@ -416,9 +416,9 @@ def _exercise_links(
         if publication is None:
             site_href = f"source/{encoded_source}.html#L{start}-L{end}"
         else:
-            base = publication.docs_base_url.rstrip("/")
             site_href = (
-                f"{base}/releases/{publication.release_id}/source/{encoded_source}.html"
+                f"https://github.com/{publication.starter_repository}/blob/"
+                f"{publication.release_id}/{encoded_source}"
                 f"#L{start}-L{end}"
             )
         links.append(
@@ -926,7 +926,19 @@ def _build_mkdocs_site(
 def _write_mathjax_config(destination: Path) -> None:
     destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     destination.write_text(
-        "window.MathJax = {tex: {inlineMath: [['\\\\(', '\\\\)'], ['$', '$']]}};\n",
+        """window.MathJax = {
+  tex: {
+    inlineMath: [[\"\\\\(\", \"\\\\)\"], [\"$\", \"$\"]],
+    displayMath: [[\"\\\\[\", \"\\\\]\"], [\"$$\", \"$$\"]],
+    tags: \"all\",
+    processEnvironments: true
+  },
+  options: {
+    ignoreHtmlClass: \"mathjax_ignore\",
+    processHtmlClass: \"arithmatex\"
+  }
+};
+""",
         encoding="utf-8",
     )
 

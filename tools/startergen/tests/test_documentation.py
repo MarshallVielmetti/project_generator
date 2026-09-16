@@ -34,8 +34,8 @@ def test_documentation_build_covers_student_and_site_outputs(tmp_path: Path) -> 
     assert "!!! note" not in readme
     assert (result.readme.parent / "assets" / "lab-diagram.svg").is_file()
     assert (
-        "https://example.com/minimal-lab/releases/v1/source/src/lab_project/"
-        "dynamics/unicycle.py.html#L7-L8"
+        "https://github.com/example/minimal-lab-starter/blob/v1/src/lab_project/"
+        "dynamics/unicycle.py#L7-L8"
     ) in site_html
     source_page = result.site / "source/src/lab_project/dynamics/unicycle.py.html"
     assert source_page.is_file()
@@ -43,12 +43,25 @@ def test_documentation_build_covers_student_and_site_outputs(tmp_path: Path) -> 
     assert 'id="L7-L8"' in source_page_text
     assert 'id="L7"' in source_page_text
     assert "https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js" in site_html
+    mathjax_config = (result.site / "_startergen" / "mathjax-config.js").read_text(
+        encoding="utf-8"
+    )
+    assert 'tags: "all"' in mathjax_config
+    assert 'displayMath: [["\\\\[", "\\\\]"], ["$$", "$$"]]' in mathjax_config
+    assert "processEnvironments: true" in mathjax_config
     assert '<meta name="generator" content="mkdocs-' in site_html
     assert '<div class="admonition note">' in site_html
     assert '<div class="arithmatex">\\[' in site_html
     assert "\\begin{bmatrix}" in site_html
     assert index["exercises"][0]["source"]["start_line"] == 7
     assert index["exercises"][0]["source"]["end_line"] == 8
+    assert index["exercises"][0]["links"] == {
+        "readme": "src/lab_project/dynamics/unicycle.py#L7-L8",
+        "site": (
+            "https://github.com/example/minimal-lab-starter/blob/v1/"
+            "src/lab_project/dynamics/unicycle.py#L7-L8"
+        ),
+    }
     manifest = json.loads(
         (result.readme.parent / ".startergen" / "manifest.json").read_text(encoding="utf-8")
     )
@@ -135,8 +148,8 @@ extra_css:
     html = page.read_text(encoding="utf-8")
     assert "First exercise" in html
     assert (
-        "https://example.com/minimal-lab/releases/v1/source/src/lab_project/"
-        "dynamics/unicycle.py.html#L7-L8"
+        "https://github.com/example/minimal-lab-starter/blob/v1/src/lab_project/"
+        "dynamics/unicycle.py#L7-L8"
     ) in html
     assert "../../assets/lab-diagram.svg" in html
     assert (result.site / "stylesheets" / "extra.css").is_file()
